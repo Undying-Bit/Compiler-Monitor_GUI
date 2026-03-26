@@ -1,0 +1,2 @@
+C:\Users\Administrator\Code\Compile-Monitor_GUI\dist\MonitorSMSLauncher\MonitorSMSLauncher.pdb
+C:\Users\Administrator\Code\Compile-Monitor_GUI\dist\MonitorSMSLauncher\MonitorSMSLauncher.exe

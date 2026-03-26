@@ -1,0 +1,7 @@
+﻿# Compile project ignores
+/dist/
+/build/
+/.pyinstaller/
+/packaging/artifacts/
+/.tmp/
+.env

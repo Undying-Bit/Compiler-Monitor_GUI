@@ -1,0 +1,16 @@
+name = "station-monitor-updates"
+main = "src/index.ts"
+compatibility_date = "2026-03-23"
+workers_dev = true
+
+# Update these values for your account.
+account_id = "e3f3cc22b2042d2b77a6fbbed5c2f54c"
+
+[vars]
+BASE_PREFIX = ""
+# Optional. If set, requests must include Authorization: Bearer <token> or ?token=<token>.
+# UPDATE_TOKEN = "REPLACE_ME"
+
+[[r2_buckets]]
+binding = "UPDATES_BUCKET"
+bucket_name = "monitor-updates"

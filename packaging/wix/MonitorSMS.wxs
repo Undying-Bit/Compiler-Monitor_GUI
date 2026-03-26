@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Monitor SMS"
+    Manufacturer="Internal Tools"
+    Version="$(var.Version)"
+    UpgradeCode="{7F2FCA2E-0E1A-4E65-90C1-7D8C5B7A01C2}"
+    Scope="perUser"
+  >
+    <?ifdef ArpIcon?>
+      <Icon Id="AppIcon" SourceFile="$(var.ArpIcon)" />
+      <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <?endif?>
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Monitor SMS is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+        <Directory Id="INSTALLROOT" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="MonitorSMS">
+          <Component Id="LauncherComponent" Guid="*">
+            <File Id="LauncherExe" Source="$(var.LauncherExe)" KeyPath="yes">
+              <Shortcut
+                Id="StartMenuShortcut"
+                Directory="ProgramMenuDir"
+                Name="Monitor SMS"
+                WorkingDirectory="INSTALLFOLDER"
+                Advertise="no"
+              />
+              <Shortcut
+                Id="DesktopShortcut"
+                Directory="DesktopFolder"
+                Name="Monitor SMS"
+                WorkingDirectory="INSTALLFOLDER"
+                Advertise="no"
+              />
+            </File>
+            <RemoveFolder Id="RemoveProgramMenuDir" Directory="ProgramMenuDir" On="uninstall" />
+          </Component>
+
+          <Component Id="EnvComponent" Guid="*" NeverOverwrite="yes">
+            <File Id="EnvFile" Source="$(var.EnvFile)" Name=".env" KeyPath="yes" />
+          </Component>
+
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuDir" Name="Monitor SMS" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder" />
+
+    <Feature Id="MainFeature" Title="Monitor SMS" Level="1">
+      <ComponentRef Id="LauncherComponent" />
+      <ComponentRef Id="EnvComponent" />
+    </Feature>
+  </Package>
+</Wix>
