@@ -1,43 +1,47 @@
-# Cloudflare Worker for Update URLs
+# MonitorSMS Update / Data Worker
 
-This worker serves `latest.json` and versioned ZIPs from an R2 bucket.
+This Worker brokers signed update artifacts and database downloads from R2 without shipping long-lived cloud credentials to the desktop client.
 
-## Setup
+## Routes
 
-1. Create an R2 bucket (example: `station-monitor-updates`).
-2. Upload update files to the bucket:
+- `/updates/latest.json`
+- `/updates/latest.json.sig`
+- `/updates/MonitorSMS-<version>.zip`
+- `/updates/MonitorSMS-<version>.zip.sig`
+- `/data/estaciones.db`
+- `/data/reportes.db`
 
+## Configuration
+
+`wrangler.toml` variables:
+
+- `UPDATES_PREFIX`
+- `DATA_PREFIX`
+- optional `UPDATE_TOKEN`
+
+R2 binding:
+
+- `UPDATES_BUCKET`
+
+If `UPDATE_TOKEN` is set, requests must include:
+
+```http
+Authorization: Bearer <token>
 ```
-latest.json
-MonitorSMS-0.2.6.zip
-```
 
-3. Install Wrangler and configure your account.
-4. Update `wrangler.toml`:
-   - `account_id`
-   - `bucket_name`
-   - optional `UPDATE_TOKEN`
+Query-string token authentication is intentionally unsupported.
 
-## Deploy
+## Client Settings
 
-```powershell
-wrangler deploy
-```
+Use public, non-secret client config values:
 
-## URL Usage
+- `MONITOR_UPDATE_MANIFEST_URL=https://updates.example.com/updates/latest.json`
+- `MONITOR_PRIMARY_BASE_URL=https://updates.example.com/data`
+- `MONITOR_BACKUP_BASE_URL=https://backup.example.com/data`
 
-If your worker is bound to a custom domain like `https://updates.example.com/*`,
-then:
+The desktop client must not contain `MONITOR_R2_*`, `MONITOR_B2_*`, or `UPDATE_R2_*` secrets.
 
-- `MONITOR_UPDATE_MANIFEST_URL` should be
-  `https://updates.example.com/latest.json`
-- the manifest `url` should be
-  `https://updates.example.com/MonitorSMS-0.2.6.zip`
+## Integrity
 
-## Optional Auth
-
-Set `UPDATE_TOKEN` in `wrangler.toml` to require a token.
-Clients can send:
-
-- `Authorization: Bearer <token>`
-- or `?token=<token>` in the URL
+- `latest.json` and update ZIPs are expected to have detached `.sig` sidecars.
+- ZIP uploads should include `sha256` object metadata so the Worker can forward it as `x-monitor-sha256`.

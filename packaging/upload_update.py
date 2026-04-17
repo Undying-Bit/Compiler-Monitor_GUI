@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
-from typing import Iterable
 
 
 def parse_bool(value: str, *, default: bool) -> bool:
@@ -23,11 +23,6 @@ def normalize_prefix(prefix: str) -> str:
     return prefix.strip().strip("/")
 
 
-def chunked(items: list[dict[str, str]], size: int) -> Iterable[list[dict[str, str]]]:
-    for start in range(0, len(items), size):
-        yield items[start : start + size]
-
-
 def ensure_file(path: Path, label: str) -> None:
     if not path.exists():
         raise FileNotFoundError(f"{label} not found: {path}")
@@ -35,25 +30,26 @@ def ensure_file(path: Path, label: str) -> None:
         raise FileNotFoundError(f"{label} is not a file: {path}")
 
 
-def purge_bucket(client, bucket: str) -> int:
-    paginator = client.get_paginator("list_objects_v2")
-    deleted_total = 0
-    for page in paginator.paginate(Bucket=bucket):
-        contents = page.get("Contents") or []
-        if not contents:
-            continue
-        objects = [{"Key": item["Key"]} for item in contents if "Key" in item]
-        for batch in chunked(objects, 1000):
-            response = client.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
-            errors = response.get("Errors") or []
-            if errors:
-                raise RuntimeError(f"Delete errors: {errors}")
-            deleted_total += len(batch)
-    return deleted_total
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def upload_file(client, *, bucket: str, key: str, path: Path, content_type: str) -> None:
+def upload_file(
+    client,
+    *,
+    bucket: str,
+    key: str,
+    path: Path,
+    content_type: str,
+    metadata: dict[str, str] | None = None,
+) -> None:
     extra_args = {"ContentType": content_type}
+    if metadata:
+        extra_args["Metadata"] = metadata
     client.upload_file(str(path), bucket, key, ExtraArgs=extra_args)
 
 
@@ -69,7 +65,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--verify-tls", default="true")
     parser.add_argument("--prefix", default="")
     parser.add_argument("--latest", required=True)
+    parser.add_argument("--latest-sig", required=True)
     parser.add_argument("--zip", dest="zip_path", required=True)
+    parser.add_argument("--zip-sig", required=True)
 
     args = parser.parse_args(argv)
 
@@ -89,10 +87,14 @@ def main(argv: list[str]) -> int:
         return 2
 
     latest_path = Path(args.latest).resolve()
+    latest_sig_path = Path(args.latest_sig).resolve()
     zip_path = Path(args.zip_path).resolve()
+    zip_sig_path = Path(args.zip_sig).resolve()
     try:
         ensure_file(latest_path, "latest.json")
+        ensure_file(latest_sig_path, "latest.json.sig")
         ensure_file(zip_path, "ZIP file")
+        ensure_file(zip_sig_path, "ZIP signature file")
     except FileNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -110,26 +112,50 @@ def main(argv: list[str]) -> int:
         config=Config(signature_version="s3v4"),
     )
 
-    try:
-        deleted = purge_bucket(client, args.bucket)
-    except Exception as exc:
-        print(f"Error while purging bucket: {exc}", file=sys.stderr)
-        return 2
-
     prefix = normalize_prefix(args.prefix or "")
     latest_key = f"{prefix}/latest.json" if prefix else "latest.json"
+    latest_sig_key = f"{latest_key}.sig"
     zip_key = f"{prefix}/{zip_path.name}" if prefix else zip_path.name
+    zip_sig_key = f"{zip_key}.sig"
 
     try:
-        upload_file(client, bucket=args.bucket, key=latest_key, path=latest_path, content_type="application/json; charset=utf-8")
-        upload_file(client, bucket=args.bucket, key=zip_key, path=zip_path, content_type="application/zip")
+        upload_file(
+            client,
+            bucket=args.bucket,
+            key=latest_key,
+            path=latest_path,
+            content_type="application/json; charset=utf-8",
+        )
+        upload_file(
+            client,
+            bucket=args.bucket,
+            key=latest_sig_key,
+            path=latest_sig_path,
+            content_type="application/octet-stream",
+        )
+        upload_file(
+            client,
+            bucket=args.bucket,
+            key=zip_key,
+            path=zip_path,
+            content_type="application/zip",
+            metadata={"sha256": sha256_file(zip_path)},
+        )
+        upload_file(
+            client,
+            bucket=args.bucket,
+            key=zip_sig_key,
+            path=zip_sig_path,
+            content_type="application/octet-stream",
+        )
     except Exception as exc:
         print(f"Error while uploading: {exc}", file=sys.stderr)
         return 2
 
-    print(f"Purged {deleted} objects from {args.bucket}.")
     print(f"Uploaded {latest_key}")
+    print(f"Uploaded {latest_sig_key}")
     print(f"Uploaded {zip_key}")
+    print(f"Uploaded {zip_sig_key}")
     return 0
 
 

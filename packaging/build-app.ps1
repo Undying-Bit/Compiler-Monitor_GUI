@@ -3,6 +3,8 @@
     [string]$SourceRoot = ""
 )
 
+$ErrorActionPreference = "Stop"
+
 . (Join-Path $PSScriptRoot "paths.ps1")
 $paths = Get-CompilePaths -SourceRoot $SourceRoot
 
@@ -18,13 +20,68 @@ if (-not $PythonExe) {
 }
 
 $iconPath = Join-Path $PSScriptRoot "app.ico"
-$versionFile = Join-Path $PSScriptRoot "version_info_app.txt"
+$generatedDir = Join-Path $paths.CompileRoot ".tmp\generated"
+$versionFile = Join-Path $generatedDir "version_info_app.txt"
 $manifestFile = Join-Path $PSScriptRoot "app.manifest"
 $distPath = $paths.DistPath
 $workPath = $paths.PyinstallerBuildPath
 $specPath = $paths.PyinstallerSpecPath
 
 $entry = Join-Path $root "src\station_monitor\main.py"
+
+$pyproject = Join-Path $root "pyproject.toml"
+$versionLine = Select-String -Path $pyproject -Pattern '^version\s*=' | Select-Object -First 1
+if (-not $versionLine) {
+    Write-Error "Unable to find version in $pyproject."
+    exit 1
+}
+$version = ($versionLine.Line -replace 'version\s*=\s*"(.*)"', '$1').Trim()
+$numeric = ($version -split '[^0-9.]')[0]
+$parts = $numeric -split '\.'
+if ($parts.Count -lt 3) {
+    $parts = @($parts + @(0,0,0)) | Select-Object -First 3
+} else {
+    $parts = $parts | Select-Object -First 3
+}
+$fileVer = "$($parts[0]), $($parts[1]), $($parts[2]), 0"
+
+if (-not (Test-Path $generatedDir)) {
+    New-Item -ItemType Directory -Path $generatedDir -Force | Out-Null
+}
+
+@"
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=($fileVer),
+    prodvers=($fileVer),
+    mask=0x3F,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          "040904B0",
+          [
+            StringStruct("CompanyName", "CIRES A.C."),
+            StringStruct("FileDescription", "Monitor SMS"),
+            StringStruct("FileVersion", "$version"),
+            StringStruct("InternalName", "MonitorSMS"),
+            StringStruct("OriginalFilename", "MonitorSMS.exe"),
+            StringStruct("ProductName", "Monitor SMS"),
+            StringStruct("ProductVersion", "$version"),
+          ],
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct("Translation", [0x0409, 0x04B0])]),
+  ],
+)
+"@ | Set-Content -Path $versionFile -Encoding UTF8
 
 $excludeModules = @(
     "PySide6.QtWebEngine",

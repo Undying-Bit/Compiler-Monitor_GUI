@@ -7,8 +7,9 @@ workers_dev = true
 account_id = "e3f3cc22b2042d2b77a6fbbed5c2f54c"
 
 [vars]
-BASE_PREFIX = ""
-# Optional. If set, requests must include Authorization: Bearer <token> or ?token=<token>.
+UPDATES_PREFIX = ""
+DATA_PREFIX = "data"
+# Optional. If set, requests must include Authorization: Bearer <token>.
 # UPDATE_TOKEN = "REPLACE_ME"
 
 [[r2_buckets]]

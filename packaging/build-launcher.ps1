@@ -2,8 +2,12 @@
     [string]$Configuration = "Release",
     [string]$Runtime = "win-x64",
     [string]$DotnetExe = "",
-    [string]$SourceRoot = ""
+    [string]$SourceRoot = "",
+    [string]$UpdateSigningPublicKeyPath = "",
+    [switch]$FrameworkDependent
 )
+
+$ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "paths.ps1")
 $paths = Get-CompilePaths -SourceRoot $SourceRoot
@@ -39,6 +43,21 @@ https://dotnet.microsoft.com/download/dotnet/8.0
     exit 1
 }
 
+if (-not $UpdateSigningPublicKeyPath) {
+    $UpdateSigningPublicKeyPath = $env:MONITOR_UPDATE_SIGNING_PUBLIC_KEY_PATH
+}
+if (-not $UpdateSigningPublicKeyPath) {
+    Write-Error "Update signing public key not configured. Set MONITOR_UPDATE_SIGNING_PUBLIC_KEY_PATH or pass -UpdateSigningPublicKeyPath."
+    exit 1
+}
+
+try {
+    $UpdateSigningPublicKeyPath = (Resolve-Path $UpdateSigningPublicKeyPath -ErrorAction Stop).Path
+} catch {
+    Write-Error "Update signing public key not found: $UpdateSigningPublicKeyPath"
+    exit 1
+}
+
 $line = Select-String -Path (Join-Path $root "pyproject.toml") -Pattern '^version\s*=' | Select-Object -First 1
 if ($null -eq $line) {
     Write-Error "Unable to find version in pyproject.toml."
@@ -59,6 +78,8 @@ if ($parts.Count -gt 4) {
 }
 $assemblyVersion = ($parts -join '.')
 
+$selfContained = (-not $FrameworkDependent).ToString().ToLower()
+
 $args = @(
     "publish",
     $project,
@@ -66,11 +87,15 @@ $args = @(
     "-r", $Runtime,
     "-o", $distDir,
     "-p:PublishSingleFile=true",
-    "-p:SelfContained=true",
+    "-p:SelfContained=$selfContained",
     "-p:PublishTrimmed=false",
     "-p:Version=$version",
     "-p:AssemblyVersion=$assemblyVersion",
-    "-p:FileVersion=$assemblyVersion"
+    "-p:FileVersion=$assemblyVersion",
+    "-p:UpdateSigningPublicKeyFile=$UpdateSigningPublicKeyPath"
 )
 
 & $DotnetExe @args
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}

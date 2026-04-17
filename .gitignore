@@ -4,4 +4,15 @@
 /.pyinstaller/
 /packaging/artifacts/
 /.tmp/
+/.wix/
+/.npm-cache/
+/packaging/*/bin/
+/packaging/*/obj/
+__pycache__/
+*.py[cod]
+*.pdb
+*.wixpdb
+*.cab
 .env
+.env.enc
+/packaging/local.env

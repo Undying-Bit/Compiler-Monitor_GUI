@@ -1,77 +1,52 @@
-﻿param(
-  [string]$SourceRoot = ""
+param(
+  [string]$SourceRoot = "",
+  [string]$LocalEnvPath = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-# Run from the repo root (one level above /packaging).
-$packagingRoot = Split-Path -Parent $PSScriptRoot
-$repoRoot = Split-Path -Parent $packagingRoot
-Set-Location -Path $repoRoot
-
-if (-not ("Win32Flash" -as [type])) {
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class Win32Flash {
-  [StructLayout(LayoutKind.Sequential)]
-  public struct FLASHWINFO {
-    public UInt32 cbSize;
-    public IntPtr hwnd;
-    public UInt32 dwFlags;
-    public UInt32 uCount;
-    public UInt32 dwTimeout;
-  }
-  [DllImport("user32.dll")]
-  public static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
-}
-"@
-}
-
-function Invoke-WindowFlash {
-  param(
-    [int]$Count = 6
-  )
-  try {
-    $hwnd = (Get-Process -Id $pid).MainWindowHandle
-    if ($hwnd -ne [IntPtr]::Zero) {
-      $info = New-Object Win32Flash+FLASHWINFO
-      $info.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($info)
-      $info.hwnd = $hwnd
-      $info.dwFlags = 3  # FLASHW_ALL
-      $info.uCount = [uint32]$Count
-      $info.dwTimeout = 0
-      [Win32Flash]::FlashWindowEx([ref]$info) | Out-Null
-    }
-  } catch {
-    # Non-fatal: flashing is best-effort.
-  }
-}
-
-function Invoke-CompletionAlert {
-  param(
-    [bool]$Success
-  )
-  if ($Success) {
-    [console]::Beep(880, 250)
-    Start-Sleep -Milliseconds 120
-    [console]::Beep(1175, 250)
-  } else {
-    [console]::Beep(300, 600)
-  }
-  Invoke-WindowFlash
-}
+. (Join-Path $PSScriptRoot "common.ps1")
 
 $success = $false
 try {
-  $sourceArgs = @()
-  if ($SourceRoot) {
-    $sourceArgs = @("-SourceRoot", $SourceRoot)
+  $context = Initialize-PackagingWrapper -ScriptRoot $PSScriptRoot -LocalEnvPath $LocalEnvPath
+  Assert-RequiredEnv -Names @(
+    "MONITOR_UPDATE_SIGNING_PUBLIC_KEY_PATH",
+    "MONITOR_UPDATE_SIGNING_KEY_PATH",
+    "MONITOR_PRIMARY_BASE_URL",
+    "MONITOR_UPDATE_MANIFEST_URL"
+  )
+
+  $updateBaseUrl = Resolve-UpdateBaseUrl
+  if (-not $updateBaseUrl) {
+    throw "MONITOR_UPDATE_BASE_URL is required. Set it directly or set MONITOR_UPDATE_MANIFEST_URL ending with /latest.json."
   }
-  powershell -ExecutionPolicy Bypass -File (Join-Path $packagingRoot "build-app.ps1") @sourceArgs
-  powershell -ExecutionPolicy Bypass -File (Join-Path $packagingRoot "build-launcher.ps1") @sourceArgs
-  powershell -ExecutionPolicy Bypass -File (Join-Path $packagingRoot "make-update.ps1") -BaseUrl https://station-monitor-updates.p-gavino.workers.dev @sourceArgs
-  powershell -ExecutionPolicy Bypass -File (Join-Path $packagingRoot "build-msi.ps1") @sourceArgs
+
+  $sourceArgs = New-SourceArgs -SourceRoot $SourceRoot
+
+  Invoke-PackagingScript -ScriptPath (Join-Path $context.PackagingRoot "build-app.ps1") -Arguments $sourceArgs
+  $launcherArgs = @(
+    "-FrameworkDependent",
+    "-UpdateSigningPublicKeyPath", (Get-WrapperEnv -Name "MONITOR_UPDATE_SIGNING_PUBLIC_KEY_PATH")
+  ) + $sourceArgs
+  Invoke-PackagingScript -ScriptPath (Join-Path $context.PackagingRoot "build-launcher.ps1") -Arguments $launcherArgs
+
+  $updateArgs = @(
+    "-BaseUrl", $updateBaseUrl,
+    "-SigningKeyPath", (Get-WrapperEnv -Name "MONITOR_UPDATE_SIGNING_KEY_PATH")
+  ) + $sourceArgs
+  Invoke-PackagingScript -ScriptPath (Join-Path $context.PackagingRoot "make-update.ps1") -Arguments $updateArgs
+
+  $msiArgs = @(
+    "-ManifestUrl", (Get-WrapperEnv -Name "MONITOR_UPDATE_MANIFEST_URL"),
+    "-PrimaryBaseUrl", (Get-WrapperEnv -Name "MONITOR_PRIMARY_BASE_URL")
+  )
+  $msiArgs = Add-OptionalArgFromEnv -Arguments $msiArgs -ParameterName "BackupBaseUrl" -EnvName "MONITOR_BACKUP_BASE_URL"
+  $msiArgs = Add-OptionalArgFromEnv -Arguments $msiArgs -ParameterName "EstacionesKey" -EnvName "MONITOR_KEY_ESTACIONES"
+  $msiArgs = Add-OptionalArgFromEnv -Arguments $msiArgs -ParameterName "ReportesKey" -EnvName "MONITOR_KEY_REPORTES"
+  $msiArgs = Add-OptionalArgFromEnv -Arguments $msiArgs -ParameterName "DebugPanelVisible" -EnvName "MONITOR_DEBUG_PANEL_VISIBLE"
+  Invoke-PackagingScript -ScriptPath (Join-Path $context.PackagingRoot "build-msi.ps1") -Arguments @($msiArgs + $sourceArgs)
+
   $success = $true
 } catch {
   $success = $false

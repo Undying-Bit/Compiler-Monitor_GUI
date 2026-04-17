@@ -2,47 +2,24 @@
     [string]$Version = "",
     [string]$LauncherExe = "",
     [string]$Output = "",
-    [string]$SourceRoot = ""
+    [string]$SourceRoot = "",
+    [string]$ManifestUrl = "",
+    [string]$PrimaryBaseUrl = "",
+    [string]$BackupBaseUrl = "",
+    [string]$EstacionesKey = "",
+    [string]$ReportesKey = "",
+    [string]$DebugPanelVisible = "",
+    [switch]$AllowSelfContained
 )
+
+$ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "paths.ps1")
 $paths = Get-CompilePaths -SourceRoot $SourceRoot
 
 $root = $paths.SourceRoot
 $wxs = Join-Path $PSScriptRoot "wix\MonitorSMS.wxs"
-$envFile = Join-Path $PSScriptRoot ".env"
-if (-not (Test-Path $envFile)) {
-    $envFile = Join-Path $PSScriptRoot "env.template"
-}
-
-function Get-EnvValue {
-    param(
-        [string]$Path,
-        [string]$Key
-    )
-    if (-not (Test-Path $Path)) {
-        return $null
-    }
-    foreach ($raw in Get-Content -Path $Path) {
-        $line = $raw.Trim()
-        if ($line.Length -eq 0 -or $line.StartsWith("#") -or -not $line.Contains("=")) {
-            continue
-        }
-        $idx = $line.IndexOf("=")
-        $k = $line.Substring(0, $idx).Trim()
-        if ($k -ne $Key) {
-            continue
-        }
-        $value = $line.Substring($idx + 1).Trim()
-        if ($value.Length -ge 2) {
-            if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
-                $value = $value.Substring(1, $value.Length - 2)
-            }
-        }
-        return $value
-    }
-    return $null
-}
+$clientConfigFile = Join-Path $paths.CompileRoot ".tmp\client-config\installer.env"
 
 function Resolve-WixCommand {
     $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
@@ -123,13 +100,40 @@ if (-not (Test-Path $LauncherExe)) {
     exit 1
 }
 
+$launcherItem = Get-Item -LiteralPath $LauncherExe -ErrorAction SilentlyContinue
+if ($launcherItem -and -not $AllowSelfContained) {
+    $sizeMb = [math]::Round($launcherItem.Length / 1MB, 1)
+    if ($launcherItem.Length -gt 30MB) {
+        Write-Error @"
+Launcher exe appears to be self-contained (~$sizeMb MB).
+Rebuild the launcher framework-dependent, then rerun:
+  .\packaging\build-launcher.ps1 -FrameworkDependent
+  .\packaging\build-msi.ps1
+
+To override this check, pass -AllowSelfContained.
+"@
+        exit 1
+    }
+}
+
 if (-not $Output) {
     $Output = Join-Path $paths.ArtifactsPath "MonitorSMS-$Version.msi"
 }
 
-$manifestUrl = Get-EnvValue -Path $envFile -Key "MONITOR_UPDATE_MANIFEST_URL"
-if ([string]::IsNullOrWhiteSpace($manifestUrl)) {
-    Write-Error "MONITOR_UPDATE_MANIFEST_URL is missing or blank in $envFile. Set it so the launcher can download the initial version."
+$clientConfigArgs = @{
+    OutputPath = $clientConfigFile
+    ManifestUrl = $ManifestUrl
+    PrimaryBaseUrl = $PrimaryBaseUrl
+    BackupBaseUrl = $BackupBaseUrl
+    EstacionesKey = $EstacionesKey
+    ReportesKey = $ReportesKey
+}
+if ($PSBoundParameters.ContainsKey("DebugPanelVisible")) {
+    $clientConfigArgs.DebugPanelVisible = $DebugPanelVisible
+}
+
+& (Join-Path $PSScriptRoot "new-client-config.ps1") @clientConfigArgs
+if (-not $?) {
     exit 1
 }
 $arpIcon = Join-Path $PSScriptRoot "app.ico"
@@ -137,9 +141,10 @@ $arpIcon = Join-Path $PSScriptRoot "app.ico"
 $args = @(
     "build",
     $wxs,
+    "-ext", "WixToolset.Util.wixext",
     "-d", "Version=$Version",
     "-d", "LauncherExe=$LauncherExe",
-    "-d", "EnvFile=$envFile",
+    "-d", "EnvFile=$clientConfigFile",
     "-o", $Output
 )
 
@@ -148,3 +153,6 @@ if (Test-Path $arpIcon) {
 }
 
 & $wixCommand.Executable @($wixCommand.PrefixArgs + $args)
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}

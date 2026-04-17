@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$Endpoint = "",
     [string]$Bucket = "",
     [string]$AccessKey = "",
@@ -9,7 +9,6 @@
     [Nullable[bool]]$VerifyTls,
     [string]$Prefix = "",
     [string]$ArtifactsDir = "",
-    [switch]$Force,
     [string]$SourceRoot = ""
 )
 
@@ -17,41 +16,13 @@ $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "paths.ps1")
 $paths = Get-CompilePaths -SourceRoot $SourceRoot
-$compileRoot = $paths.CompileRoot
-
-function Import-DotEnv {
-    param([string]$Path)
-    if (-not (Test-Path $Path)) {
-        return
-    }
-    foreach ($rawLine in Get-Content -Path $Path) {
-        $line = $rawLine.Trim()
-        if (-not $line) { continue }
-        if ($line.StartsWith("#")) { continue }
-        if ($line -notmatch "=") { continue }
-
-        $parts = $line.Split("=", 2)
-        $key = $parts[0].Trim()
-        if (-not $key) { continue }
-        if (Test-Path "env:$key") { continue }
-
-        $value = $parts[1].Trim()
-        if ($value.Length -ge 2) {
-            if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
-                $value = $value.Substring(1, $value.Length - 2)
-            }
-        }
-        Set-Item -Path "Env:$key" -Value $value
-    }
-}
 
 function Get-EnvBool {
     param(
         [string]$Name,
         [bool]$Default
     )
-    $value = Get-Item -Path "Env:$Name" -ErrorAction SilentlyContinue
-    $value = if ($null -ne $value) { $value.Value } else { $null }
+    $value = [Environment]::GetEnvironmentVariable($Name, "Process")
     if ($null -eq $value -or $value -eq "") {
         return $Default
     }
@@ -71,9 +42,6 @@ function Require-Value {
     }
 }
 
-Import-DotEnv (Join-Path $compileRoot ".env")
-Import-DotEnv (Join-Path $PSScriptRoot ".env")
-
 if (-not $ArtifactsDir) {
     $ArtifactsDir = $paths.ArtifactsPath
 }
@@ -83,8 +51,13 @@ if (-not (Test-Path $ArtifactsDir)) {
 }
 
 $latestPath = Join-Path $ArtifactsDir "latest.json"
+$latestSigPath = "$latestPath.sig"
 if (-not (Test-Path $latestPath)) {
     Write-Error "latest.json not found: $latestPath"
+    exit 1
+}
+if (-not (Test-Path $latestSigPath)) {
+    Write-Error "latest.json.sig not found: $latestSigPath"
     exit 1
 }
 
@@ -103,14 +76,25 @@ if (-not $version) {
 
 $zipName = "MonitorSMS-$version.zip"
 $zipPath = Join-Path $ArtifactsDir $zipName
+$zipSigPath = "$zipPath.sig"
 if (-not (Test-Path $zipPath)) {
     Write-Error "Expected ZIP not found: $zipPath"
+    exit 1
+}
+if (-not (Test-Path $zipSigPath)) {
+    Write-Error "Expected ZIP signature not found: $zipSigPath"
     exit 1
 }
 
 $url = [string]$manifest.url
 if (-not $url) {
     Write-Error "latest.json is missing the url field."
+    exit 1
+}
+
+$signatureUrl = [string]$manifest.signature_url
+if (-not $signatureUrl) {
+    Write-Error "latest.json is missing the signature_url field."
     exit 1
 }
 
@@ -126,6 +110,11 @@ if (-not $urlZipName) {
 }
 if ($urlZipName -ne $zipName) {
     Write-Error "latest.json url does not end with $zipName (got $urlZipName)."
+    exit 1
+}
+
+if (-not $signatureUrl.EndsWith("$zipName.sig")) {
+    Write-Error "latest.json signature_url does not end with $zipName.sig."
     exit 1
 }
 
@@ -154,18 +143,6 @@ Require-Value -Value $Bucket -EnvName "UPDATE_R2_BUCKET" -ParamName "Bucket"
 Require-Value -Value $AccessKey -EnvName "UPDATE_R2_ACCESS_KEY" -ParamName "AccessKey"
 Require-Value -Value $SecretKey -EnvName "UPDATE_R2_SECRET_KEY" -ParamName "SecretKey"
 
-if (-not $Force) {
-    Write-Host "This will DELETE ALL objects in bucket '$Bucket' at '$Endpoint'." -ForegroundColor Yellow
-    if ($Prefix) {
-        Write-Host "Uploads will use prefix '$Prefix', but purge affects the entire bucket." -ForegroundColor Yellow
-    }
-    $confirmation = Read-Host "Type DELETE to continue"
-    if ($confirmation -ne "DELETE") {
-        Write-Host "Aborted."
-        exit 1
-    }
-}
-
 $python = Join-Path $paths.SourceRoot ".venv\\Scripts\\python.exe"
 if (-not (Test-Path $python)) {
     $python = "python"
@@ -186,7 +163,9 @@ $argsList = @(
     "--use-ssl", $useSslValue.ToString().ToLowerInvariant(),
     "--verify-tls", $verifyTlsValue.ToString().ToLowerInvariant(),
     "--latest", $latestPath,
-    "--zip", $zipPath
+    "--latest-sig", $latestSigPath,
+    "--zip", $zipPath,
+    "--zip-sig", $zipSigPath
 )
 
 if ($Region) {
@@ -205,4 +184,3 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Upload complete."
-

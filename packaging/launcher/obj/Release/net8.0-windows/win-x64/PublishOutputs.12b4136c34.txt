@@ -1,7 +1,0 @@
-C:\Users\Administrator\Code\Monitor GUI\dist\MonitorSMSLauncher\MonitorSMSLauncher.pdb
-C:\Users\Administrator\Code\Monitor GUI\dist\MonitorSMSLauncher\D3DCompiler_47_cor3.dll
-C:\Users\Administrator\Code\Monitor GUI\dist\MonitorSMSLauncher\PenImc_cor3.dll
-C:\Users\Administrator\Code\Monitor GUI\dist\MonitorSMSLauncher\PresentationNative_cor3.dll
-C:\Users\Administrator\Code\Monitor GUI\dist\MonitorSMSLauncher\vcruntime140_cor3.dll
-C:\Users\Administrator\Code\Monitor GUI\dist\MonitorSMSLauncher\wpfgfx_cor3.dll
-C:\Users\Administrator\Code\Monitor GUI\dist\MonitorSMSLauncher\MonitorSMSLauncher.exe

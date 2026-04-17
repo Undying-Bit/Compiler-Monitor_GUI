@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
     Name="Monitor SMS"
     Manufacturer="Internal Tools"
@@ -14,6 +15,10 @@
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of Monitor SMS is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <CustomAction
+      Id="SetRuntimeDir"
+      Property="MONITORSMSRUNTIMEDIR"
+      Value="[LocalAppDataFolder]MonitorSMS\\runtime" />
 
     <StandardDirectory Id="LocalAppDataFolder">
         <Directory Id="INSTALLROOT" Name="Programs">
@@ -44,6 +49,14 @@
 
         </Directory>
       </Directory>
+      <Directory Id="MonitorSMSDataDir" Name="MonitorSMS">
+        <Directory Id="MonitorSMSRuntimeDir" Name="runtime">
+          <Component Id="RuntimeCleanupComponent" Guid="{665222B9-85DD-4C17-B2AB-C0DA7F3634C5}">
+            <CreateFolder />
+            <util:RemoveFolderEx Id="RemoveMonitorSMSRuntime" Property="MONITORSMSRUNTIMEDIR" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
@@ -55,6 +68,26 @@
     <Feature Id="MainFeature" Title="Monitor SMS" Level="1">
       <ComponentRef Id="LauncherComponent" />
       <ComponentRef Id="EnvComponent" />
+      <ComponentRef Id="RuntimeCleanupComponent" />
     </Feature>
+
+    <CustomAction
+      Id="LaunchLauncher"
+      FileRef="LauncherExe"
+      ExeCommand=""
+      Execute="immediate"
+      Impersonate="yes"
+      Return="asyncNoWait" />
+
+    <InstallExecuteSequence>
+      <Custom
+        Action="SetRuntimeDir"
+        Before="InstallValidate"
+        Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom
+        Action="LaunchLauncher"
+        After="InstallFinalize"
+        Condition="NOT Installed AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
   </Package>
 </Wix>

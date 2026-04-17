@@ -3,6 +3,7 @@ using System.Drawing;
 using System.IO.Compression;
 using System.Net.Http;
 using System.Security.Cryptography;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -18,6 +19,8 @@ static class Program
     private const string CurrentFile = "current.json";
     private const string RuntimeDirName = "runtime";
     private const string StageDirName = "stage";
+    private const string SignatureSuffix = ".sig";
+    private const string UpdateSigningKeyResource = "MonitorSMSLauncher.update-signing-public-key.pem";
     private static readonly string BaselinePattern = "MonitorSMS-*.zip";
 
     [STAThread]
@@ -110,7 +113,7 @@ static class Program
             var manifest = FetchManifest(updateUrl, logger);
             if (manifest is not null && CompareVersions(manifest.Version, current.Version) > 0)
             {
-                logger.Info($"Update available: {manifest.Version}");
+                logger.Info($"Cloud version is newer: {manifest.Version} (installed {current.Version})");
                 if (!InstallFromManifest(manifest, installDir, runtimeDir, stageDir, logger))
                 {
                     var choice = MessageBox.Show(
@@ -126,7 +129,7 @@ static class Program
                 }
                 return 0;
             }
-            logger.Info("No update available.");
+            logger.Info("No newer update available.");
         }
         else
         {
@@ -144,6 +147,15 @@ static class Program
         var download = DownloadToStage(manifest.Url, stageDir, logger, progress);
         if (download is null)
         {
+            progress.CloseWindow();
+            return false;
+        }
+
+        progress.SetStatus("Verifying signature...");
+        progress.SetIndeterminate();
+        if (!VerifyFileSignature(download, manifest.SignatureUrl, logger))
+        {
+            SafeDelete(download);
             progress.CloseWindow();
             return false;
         }
@@ -210,11 +222,17 @@ static class Program
     {
         try
         {
-            using var client = new HttpClient();
-            client.Timeout = TimeSpan.FromSeconds(10);
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("MonitorSMSLauncher/1.0");
-            var json = client.GetStringAsync(url).GetAwaiter().GetResult();
-            var doc = JsonDocument.Parse(json);
+            using var client = CreateHttpClient(TimeSpan.FromSeconds(10));
+            var payload = client.GetByteArrayAsync(url).GetAwaiter().GetResult();
+            var signatureUrl = BuildSignatureUrl(url);
+            var signature = client.GetByteArrayAsync(signatureUrl).GetAwaiter().GetResult();
+            if (!VerifyDataSignature(payload, signature, logger))
+            {
+                logger.Warn("Manifest signature verification failed.");
+                return null;
+            }
+
+            using var doc = JsonDocument.Parse(StripUtf8Bom(payload));
             var root = doc.RootElement;
             var version = root.TryGetProperty("version", out var v) ? v.GetString() : null;
             var download = root.TryGetProperty("url", out var u) ? u.GetString() : null;
@@ -225,16 +243,118 @@ static class Program
             }
             var sha = root.TryGetProperty("sha256", out var s) ? s.GetString() : null;
             var entry = root.TryGetProperty("entry_exe", out var e) ? e.GetString() : null;
+            var downloadSignature = root.TryGetProperty("signature_url", out var sigUrl) ? sigUrl.GetString() : null;
             return new UpdateManifest(
                 version,
                 download!,
                 string.IsNullOrWhiteSpace(sha) ? null : sha,
-                string.IsNullOrWhiteSpace(entry) ? DefaultEntryExe : entry!
+                string.IsNullOrWhiteSpace(entry) ? DefaultEntryExe : entry!,
+                string.IsNullOrWhiteSpace(downloadSignature) ? BuildSignatureUrl(download!) : downloadSignature!
             );
         }
         catch (Exception ex)
         {
             logger.Warn($"Failed to fetch manifest: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static ReadOnlyMemory<byte> StripUtf8Bom(byte[] payload)
+    {
+        if (payload.Length >= 3 && payload[0] == 0xEF && payload[1] == 0xBB && payload[2] == 0xBF)
+        {
+            return payload.AsMemory(3);
+        }
+
+        return payload;
+    }
+
+    private static HttpClient CreateHttpClient(TimeSpan timeout)
+    {
+        var client = new HttpClient
+        {
+            Timeout = timeout
+        };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("MonitorSMSLauncher/1.0");
+        return client;
+    }
+
+    private static string BuildSignatureUrl(string url)
+    {
+        var uri = new Uri(url);
+        var builder = new UriBuilder(uri)
+        {
+            Path = uri.AbsolutePath + SignatureSuffix
+        };
+        return builder.Uri.ToString();
+    }
+
+    private static bool VerifyFileSignature(string path, string signatureUrl, LauncherLogger logger)
+    {
+        try
+        {
+            using var client = CreateHttpClient(TimeSpan.FromSeconds(30));
+            var signature = client.GetByteArrayAsync(signatureUrl).GetAwaiter().GetResult();
+            using var rsa = LoadUpdateSigningKey(logger);
+            if (rsa is null)
+            {
+                return false;
+            }
+
+            using var stream = File.OpenRead(path);
+            return rsa.VerifyData(stream, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        }
+        catch (Exception ex)
+        {
+            logger.Warn($"Failed to verify detached signature for {path}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static bool VerifyDataSignature(byte[] payload, byte[] signature, LauncherLogger logger)
+    {
+        try
+        {
+            using var rsa = LoadUpdateSigningKey(logger);
+            if (rsa is null)
+            {
+                return false;
+            }
+            return rsa.VerifyData(payload, signature, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        }
+        catch (Exception ex)
+        {
+            logger.Warn($"Failed to verify detached signature: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static RSA? LoadUpdateSigningKey(LauncherLogger logger)
+    {
+        try
+        {
+            using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(UpdateSigningKeyResource);
+            if (stream is null)
+            {
+                logger.Warn("Embedded update signing public key is missing.");
+                return null;
+            }
+
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            var pem = reader.ReadToEnd();
+            if (string.IsNullOrWhiteSpace(pem))
+            {
+                logger.Warn("Embedded update signing public key is empty.");
+                return null;
+            }
+
+            var rsa = RSA.Create();
+            rsa.ImportFromPem(pem);
+            return rsa;
+        }
+        catch (Exception ex)
+        {
+            logger.Warn($"Unable to load embedded update signing public key: {ex.Message}");
             return null;
         }
     }
@@ -389,9 +509,7 @@ static class Program
         try
         {
             Directory.CreateDirectory(stageDir);
-            using var client = new HttpClient();
-            client.Timeout = TimeSpan.FromMinutes(5);
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("MonitorSMSLauncher/1.0");
+            using var client = CreateHttpClient(TimeSpan.FromMinutes(5));
             using var response = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
             response.EnsureSuccessStatusCode();
 
@@ -434,10 +552,17 @@ static class Program
         using var archive = ZipFile.OpenRead(zipPath);
         var totalEntries = archive.Entries.Count;
         var completed = 0;
+        var normalizedRoot = Path.GetFullPath(extractRoot);
 
         foreach (var entry in archive.Entries)
         {
-            var destPath = Path.Combine(extractRoot, entry.FullName);
+            var destPath = Path.GetFullPath(Path.Combine(extractRoot, entry.FullName));
+            if (!IsPathWithinRoot(normalizedRoot, destPath))
+            {
+                logger.Warn($"Zip entry rejected due to path traversal: {entry.FullName}");
+                throw new InvalidDataException($"Zip entry escapes staging directory: {entry.FullName}");
+            }
+
             if (string.IsNullOrEmpty(entry.Name))
             {
                 Directory.CreateDirectory(destPath);
@@ -454,6 +579,20 @@ static class Program
             completed++;
             progress?.SetProgress(completed, totalEntries);
         }
+    }
+
+    private static bool IsPathWithinRoot(string rootPath, string candidatePath)
+    {
+        var normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(rootPath));
+        var normalizedCandidate = Path.TrimEndingDirectorySeparator(Path.GetFullPath(candidatePath));
+        if (string.Equals(normalizedRoot, normalizedCandidate, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return normalizedCandidate.StartsWith(
+            normalizedRoot + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase);
     }
 
     private static string Sha256File(string path)
@@ -966,5 +1105,5 @@ static class Program
     }
 
     private sealed record InstalledApp(string Version, string Path);
-    private sealed record UpdateManifest(string Version, string Url, string? Sha256, string EntryExe);
+    private sealed record UpdateManifest(string Version, string Url, string? Sha256, string EntryExe, string SignatureUrl);
 }

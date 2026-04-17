@@ -9,4 +9,8 @@
     <RootNamespace>MonitorSMSLauncher</RootNamespace>
     <ApplicationIcon>..\launcher.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup Condition="'$(UpdateSigningPublicKeyFile)' != '' and Exists('$(UpdateSigningPublicKeyFile)')">
+    <EmbeddedResource Include="$(UpdateSigningPublicKeyFile)" LogicalName="MonitorSMSLauncher.update-signing-public-key.pem" />
+  </ItemGroup>
 </Project>

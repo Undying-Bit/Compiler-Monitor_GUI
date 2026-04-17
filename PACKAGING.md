@@ -1,15 +1,38 @@
-﻿# MonitorSMS Windows Packaging (Compile Project)
+# MonitorSMS Windows Packaging (Compile Project)
 
-This guide documents the recommended Windows packaging, update, and installer flow.
-It assumes a dedicated compile project at:
+This workspace packages the desktop app from the sibling source repo:
 
-C:\Users\Administrator\Code\Compile-Monitor_GUI
+`C:\Users\Administrator\Code\Monitor GUI`
 
-The scripts resolve the app source root in this order:
+The packaging flow is now fail-closed:
 
-1. `-SourceRoot` parameter
-2. `MONITOR_GUI_ROOT` environment variable
-3. Sibling folder: `C:\Users\Administrator\Code\Monitor GUI`
+- the MSI ships only a sanitized client `.env`
+- update manifests and ZIPs must be detached-signed
+- launcher builds require an embedded public verification key
+- upload scripts no longer read repo-local secret files
+- update uploads no longer purge the bucket
+
+## Source Resolution
+
+The packaging scripts resolve the app source root in this order:
+
+1. `-SourceRoot`
+2. `MONITOR_GUI_ROOT`
+3. `C:\Users\Administrator\Code\Monitor GUI`
+
+## Secure Config Model
+
+The shipped desktop client supports only non-secret runtime configuration:
+
+- `MONITOR_PRIMARY_BASE_URL`
+- `MONITOR_BACKUP_BASE_URL`
+- `MONITOR_KEY_ESTACIONES`
+- `MONITOR_KEY_REPORTES`
+- `MONITOR_UPDATE_MANIFEST_URL`
+- `MONITOR_DEBUG_PANEL_VISIBLE`
+
+Do not put `MONITOR_R2_*`, `MONITOR_B2_*`, `UPDATE_R2_*`, access keys, secret keys, or session tokens in the client config.
+Those values must stay in CI, release automation, or server-side broker infrastructure only.
 
 ## Quick Build
 
@@ -19,196 +42,164 @@ Install PyInstaller into the app repo venv:
 & "C:\Users\Administrator\Code\Monitor GUI\.venv\Scripts\python.exe" -m pip install pyinstaller
 ```
 
-Build the app (one-folder):
+Build the PyInstaller app:
 
 ```powershell
 .\packaging\build-app.ps1
 ```
 
-Build the launcher (native, self-contained):
+Generate an update-signing key pair once, outside the repo:
 
 ```powershell
-.\packaging\build-launcher.ps1
+dotnet run --project .\packaging\signer\MonitorSMSSigner.csproj -- keygen --private C:\secure\monitor-update-private.pem --public C:\secure\monitor-update-public.pem
 ```
 
-Create the update zip and manifest (for upload; not required for MSI build):
+Build the launcher with an embedded update-signing public key:
 
 ```powershell
-.\packaging\make-update.ps1 -BaseUrl https://example.com
+$env:MONITOR_UPDATE_SIGNING_PUBLIC_KEY_PATH="C:\secure\monitor-update-public.pem"
+.\packaging\build-launcher.ps1 -FrameworkDependent
 ```
 
-Build the per-user MSI (WiX v4):
+Create signed update artifacts:
 
 ```powershell
+$env:MONITOR_UPDATE_SIGNING_KEY_PATH="C:\secure\monitor-update-private.pem"
+.\packaging\make-update.ps1 -BaseUrl https://updates.example.com/updates
+```
+
+Build the MSI with a sanitized client config generated from environment variables:
+
+```powershell
+$env:MONITOR_PRIMARY_BASE_URL="https://updates.example.com/data"
+$env:MONITOR_BACKUP_BASE_URL="https://backup.example.com/data"
+$env:MONITOR_UPDATE_MANIFEST_URL="https://updates.example.com/updates/latest.json"
 .\packaging\build-msi.ps1
 ```
 
-Override the source repo location when needed:
+Build the setup bundle with a pinned runtime hash:
 
 ```powershell
-.\packaging\build-app.ps1 -SourceRoot "C:\Path\To\Monitor GUI"
+$env:MONITOR_NET8_RUNTIME_SHA256="<official-runtime-sha256>"
+.\packaging\build-bundle.ps1
 ```
 
-MSI prerequisite:
+## Root Batch Entrypoints
 
-- Install the .NET 8 SDK (global.json pins launcher builds to 8.x)
-- Install WiX as a global .NET tool: `dotnet tool install --global wix`
-- Open a new PowerShell window so `wix` is on `PATH`
+The root `.bat` files are one-click wrappers around `packaging\wrappers\*.ps1`.
+They load `packaging\local.env` when present, while existing process environment variables take precedence.
 
-## Icons, Version Info, Manifest
+Create local configuration from the template:
 
-- `packaging\app.manifest` sets `asInvoker` so the app does not trigger UAC prompts.
-- `packaging\version_info_app.txt` holds Windows version metadata for the PyInstaller app.
-- The launcher version metadata comes from `pyproject.toml` via `build-launcher.ps1`.
-- Place `packaging\app.ico` and `packaging\launcher.ico` to brand the exe files (optional).
-- If `packaging\app.ico` exists, the MSI will use it as the Add/Remove Programs icon.
-
-Update the version strings in `version_info_app.txt` whenever you bump `pyproject.toml`.
-
-## Expected Output Structure
-
-Compile project output:
-
-```
-dist\
-  MonitorSMS\
-    MonitorSMS.exe
-    _internal\
-  MonitorSMSLauncher\
-    MonitorSMSLauncher.exe
-.pyinstaller\
-  build\
-  spec\
-packaging\
-  artifacts\
+```powershell
+Copy-Item .\packaging\local.env.template .\packaging\local.env
 ```
 
-Note: `packaging\build-app.ps1` trims unused Qt modules (including WebEngine/QML)
-and removes Qt translation/QML/plugin payloads to keep update ZIPs small. If you
-add new Qt features that require those modules, update the exclude list and
-prune step in that script.
+Then fill in the values needed by each workflow:
 
-Run the exe from `dist\MonitorSMS\MonitorSMS.exe` only.
-Do not run the copy under `.pyinstaller\build`; that directory contains intermediate artifacts.
+- `run-build-all.bat`: builds the PyInstaller app, launcher, signed update artifacts, and MSI.
+- `run-build-launcher-msi.bat`: legacy name; now builds only the launcher.
+- `run-upload-update.bat`: uploads existing signed update artifacts.
 
-Recommended per-user install layout:
+## Signed Update Artifacts
 
-```
-%LOCALAPPDATA%\Programs\MonitorSMS\
-  MonitorSMSLauncher.exe
-  .env
-  MonitorSMS-0.2.6.zip (optional baseline)
-%LOCALAPPDATA%\MonitorSMS\logs\
-  monitor_sms.log
-  launcher.log
-%LOCALAPPDATA%\MonitorSMS\runtime\
-  current.json
-  app-0.2.6\
-    MonitorSMS.exe
-    _internal\
-%LOCALAPPDATA%\MonitorSMS\stage\
-  <temp extract folders>
-%LOCALAPPDATA%\MonitorSMS\tmp\
-  monitor_sms_*
-```
+`make-update.ps1` now produces:
 
-Thin MSI installs do not include a baseline ZIP; the first run downloads from the update manifest.
+- `MonitorSMS-<version>.zip`
+- `MonitorSMS-<version>.zip.sig`
+- `latest.json`
+- `latest.json.sig`
 
-## Config Files and Secrets
-
-Keep `.env` next to the launcher exe. The launcher and app read `.env` from the working directory.
-MSI shortcuts should use the install directory as the "Start in" path.
-`build-msi.ps1` will package `packaging\.env` if it exists; otherwise it falls back to `packaging\env.template`.
-
-Packaging scripts load environment from:
-
-- `C:\Users\Administrator\Code\Compile-Monitor_GUI\.env`
-- `C:\Users\Administrator\Code\Compile-Monitor_GUI\packaging\.env`
-
-## Update Manifest (HTTP/Cloud)
-
-The launcher looks at `MONITOR_UPDATE_MANIFEST_URL` in `.env`. Example:
-
-```
- MONITOR_UPDATE_MANIFEST_URL=https://example.com/latest.json
-```
-
-To disable update checks for a run, set:
-
-```
-MONITOR_SKIP_UPDATE=true
-```
-
-The manifest format:
+The manifest includes:
 
 ```json
 {
-  "version": "0.2.6",
-  "url": "https://example.com/MonitorSMS-0.2.6.zip",
-  "sha256": "abc123..."
+  "version": "0.2.10",
+  "url": "https://updates.example.com/updates/MonitorSMS-0.2.10.zip",
+  "sha256": "<zip-sha256>",
+  "entry_exe": "MonitorSMS.exe",
+  "signature_url": "https://updates.example.com/updates/MonitorSMS-0.2.10.zip.sig"
 }
 ```
 
-Run `.\packaging\make-update.ps1` to generate a ZIP and `latest.json`.
+The launcher verifies both detached signatures before trusting the manifest or ZIP.
 
-For MSI installs, keep the ZIP next to the launcher when available. The launcher
-downloads the ZIP to a staging folder and then copies only `MonitorSMS.exe` and
-`_internal` into `%LOCALAPPDATA%\MonitorSMS\runtime\app-<version>`.
+## MSI Contents
 
-## Cloudflare Worker (R2 URLs)
-
-See `packaging/worker/README.md` for a ready-to-deploy Worker that serves
-`latest.json` and ZIPs from R2. With an empty Worker prefix, the R2 objects live at bucket root:
-
-```
-latest.json
-MonitorSMS-0.2.6.zip
-```
-
-When deployed to a domain like `https://updates.example.com/*`:
-
-- `MONITOR_UPDATE_MANIFEST_URL` should be
-  `https://updates.example.com/latest.json`
-- `latest.json` should include:
-  `https://updates.example.com/MonitorSMS-0.2.6.zip`
-
-## Upload Updates (S3 API)
-
-Files larger than 300 MB should be uploaded using the S3 Compatibility API. The upload
-script purges the updates bucket first, then uploads `latest.json` plus the ZIP whose
-version matches `latest.json`.
-
-Steps:
-- Run `.\packaging\make-update.ps1` to generate `packaging\artifacts\latest.json`
-  and `MonitorSMS-<version>.zip`.
-- Set the `UPDATE_R2_*` values in `.env` or `packaging\.env` (compile project).
-- Run:
-
-```powershell
-.\packaging\upload-update.ps1
-```
-
-Notes:
-- The script validates that `latest.json.url` ends with `MonitorSMS-<version>.zip`
-  and fails if it does not.
-- The purge always deletes all objects in the bucket, even when a prefix is used
-  for uploads. Use a dedicated updates bucket.
-- To upload under a prefix, set `UPDATE_R2_PREFIX` or pass `-Prefix`. Ensure the
-  `-BaseUrl` used by `make-update.ps1` includes that prefix so `latest.json` matches.
-
-## Per-User MSI Notes
-
-A per-user MSI installs under `%LOCALAPPDATA%\Programs\MonitorSMS` and writes only to HKCU.
-This avoids UAC prompts and keeps installs scoped to each user account.
-Use WiX v4 or Advanced Installer to package:
+The per-user MSI installs under `%LOCALAPPDATA%\Programs\MonitorSMS` and contains:
 
 - `MonitorSMSLauncher.exe`
-- `packaging\.env` copied to `.env` during install when present
-- the `.env` file is not overwritten on upgrades (so secrets remain intact)
-- desktop and Start Menu shortcuts that set "Start in" to the install folder
-- `MONITOR_UPDATE_MANIFEST_URL` must be set in the packaged `.env`
+- a generated `.env` containing only the allowlisted non-secret client settings
 
-## SmartScreen and Signing
+The MSI no longer packages a developer `.env`, encrypted env file, or cloud credentials.
 
-Without a trusted code-signing certificate, SmartScreen and "Unknown Publisher" prompts are expected.
-Reputation and code signing are the normal ways to reduce those warnings.
+## Runtime Layout
+
+Expected install/runtime layout:
+
+```text
+%LOCALAPPDATA%\Programs\MonitorSMS\
+  MonitorSMSLauncher.exe
+  .env
+%LOCALAPPDATA%\MonitorSMS\logs\
+  launcher.log
+  monitor_sms.log
+%LOCALAPPDATA%\MonitorSMS\runtime\
+  current.json
+  app-<version>\
+    MonitorSMS.exe
+    _internal\
+%LOCALAPPDATA%\MonitorSMS\stage\
+  <temporary downloads>
+```
+
+## Worker / Broker Routing
+
+The bundled Worker serves two logical routes from R2:
+
+- `/updates/*` for `latest.json`, signatures, and ZIPs
+- `/data/*` for `estaciones.db` and `reportes.db`
+
+If `UPDATE_TOKEN` is configured in the Worker, only `Authorization: Bearer <token>` is accepted.
+Query-string token auth is no longer supported.
+
+## Uploading Updates
+
+`upload-update.ps1` now uploads four files:
+
+- `latest.json`
+- `latest.json.sig`
+- `MonitorSMS-<version>.zip`
+- `MonitorSMS-<version>.zip.sig`
+
+It validates that:
+
+- `latest.json` version matches the ZIP name
+- `latest.json.signature_url` matches the ZIP signature file name
+- the signature sidecar files exist before upload
+
+It does not delete existing bucket contents.
+
+Credentials must come from environment variables or explicit parameters:
+
+- `UPDATE_R2_ENDPOINT`
+- `UPDATE_R2_BUCKET`
+- `UPDATE_R2_ACCESS_KEY`
+- `UPDATE_R2_SECRET_KEY`
+- optional `UPDATE_R2_REGION`, `UPDATE_R2_SESSION_TOKEN`, `UPDATE_R2_PREFIX`
+
+## Build Hygiene
+
+- Generated version metadata is written under `.tmp\generated\` instead of mutating tracked files.
+- `.env`, `.env.enc`, `.wix`, launcher `bin/` / `obj/`, `.pdb`, `.wixpdb`, and cabinet outputs are ignored.
+- `build-launcher.ps1`, `build-msi.ps1`, and `build-bundle.ps1` now stop on tool failures instead of continuing after a bad `dotnet` or WiX invocation.
+
+## Release Requirements
+
+Before shipping a build:
+
+1. Rotate any previously exposed R2/B2/update credentials.
+2. Store update-signing private keys outside the repo, preferably in CI secret storage.
+3. Verify the generated installer `.env` contains only allowlisted non-secret keys.
+4. Upload signed update artifacts through the brokered update service path.
+5. Keep the desktop client free of direct cloud credentials.
