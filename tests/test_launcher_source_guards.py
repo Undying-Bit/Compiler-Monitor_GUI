@@ -18,6 +18,14 @@ class LauncherSourceGuardsTest(unittest.TestCase):
         self.assertIn("JsonDocument.Parse(StripUtf8Bom(payload))", source)
         self.assertIn("Zip entry rejected due to path traversal", source)
         self.assertIn("CompareVersions(manifest.Version, current.Version) > 0", source)
+        self.assertIn('LastGoodFile = "last_good.json"', source)
+        self.assertIn('LauncherHealthPathEnv = "MONITOR_LAUNCHER_HEALTH_PATH"', source)
+        self.assertIn("CandidateHealthWindow = TimeSpan.FromSeconds(60)", source)
+        self.assertIn("PromoteCandidateAfterHealth(installed, rollbackTarget", source)
+        self.assertIn("WriteLastGood(runtimeDir, app.Version, folderName, logger)", source)
+        self.assertIn("PruneRuntimeVersions(runtimeDir, folderName, rollbackFolderName, logger)", source)
+        self.assertIn("Candidate did not freshly download estaciones.db and reportes.db.", source)
+        self.assertNotIn("PruneRuntimeVersions(runtimeDir, Path.GetFileName(targetDir), logger)", source)
 
     def test_update_manifest_is_written_without_bom(self) -> None:
         source = MAKE_UPDATE.read_text(encoding="utf-8")

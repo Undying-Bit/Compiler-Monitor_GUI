@@ -146,11 +146,14 @@ Expected install/runtime layout:
   monitor_sms.log
 %LOCALAPPDATA%\MonitorSMS\runtime\
   current.json
+  last_good.json
   app-<version>\
     MonitorSMS.exe
     _internal\
 %LOCALAPPDATA%\MonitorSMS\stage\
   <temporary downloads>
+  health\
+    candidate-health-<nonce>.json
 ```
 
 ## Worker / Broker Routing

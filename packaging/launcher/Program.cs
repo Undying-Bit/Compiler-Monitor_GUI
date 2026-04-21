@@ -1,12 +1,14 @@
 using System.Diagnostics;
 using System.Drawing;
 using System.IO.Compression;
+using System.Collections.Generic;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Windows.Forms;
 
 static class Program
@@ -17,11 +19,17 @@ static class Program
     private const string ManifestEnv = "MONITOR_UPDATE_MANIFEST_URL";
     private const string SkipEnv = "MONITOR_SKIP_UPDATE";
     private const string CurrentFile = "current.json";
+    private const string LastGoodFile = "last_good.json";
     private const string RuntimeDirName = "runtime";
     private const string StageDirName = "stage";
     private const string SignatureSuffix = ".sig";
     private const string UpdateSigningKeyResource = "MonitorSMSLauncher.update-signing-public-key.pem";
+    private const string LauncherHealthPathEnv = "MONITOR_LAUNCHER_HEALTH_PATH";
+    private const string LauncherHealthNonceEnv = "MONITOR_LAUNCHER_HEALTH_NONCE";
+    private const string LauncherHealthVersionEnv = "MONITOR_LAUNCHER_HEALTH_VERSION";
+    private const string LauncherRequireFreshDbEnv = "MONITOR_LAUNCHER_REQUIRE_FRESH_DB";
     private static readonly string BaselinePattern = "MonitorSMS-*.zip";
+    private static readonly TimeSpan CandidateHealthWindow = TimeSpan.FromSeconds(60);
 
     [STAThread]
     public static int Main(string[] args)
@@ -55,12 +63,18 @@ static class Program
             if (current is not null)
             {
                 WriteCurrent(runtimeDir, current.Version, Path.GetFileName(current.Path), logger);
+                WriteLastGood(runtimeDir, current.Version, Path.GetFileName(current.Path), logger);
             }
         }
 
         if (current is null)
         {
             current = TryMigrateLegacy(installDir, stateRoot, runtimeDir, logger);
+        }
+
+        if (current is not null)
+        {
+            EnsureLastGood(runtimeDir, current, logger);
         }
 
         var baselineZip = FindBaselineZip(installDir);
@@ -71,14 +85,17 @@ static class Program
                 using var progress = new ProgressWindow("Installing MonitorSMS");
                 progress.Show();
                 progress.SetStatus("Installing baseline...");
-                if (!InstallFromZip(baselineZip.Value.path, baselineZip.Value.version, installDir, runtimeDir, stageDir, DefaultEntryExe, cleanupZip: true, logger, progress))
+                var baseline = InstallFromZip(baselineZip.Value.path, baselineZip.Value.version, installDir, runtimeDir, stageDir, DefaultEntryExe, cleanupZip: true, logger, progress);
+                if (baseline is null)
                 {
                     progress.CloseWindow();
                     ShowError("Baseline install failed. Check launcher.log for details.");
                     return 1;
                 }
+                PromoteInstalledApp(runtimeDir, baseline, rollbackFolderName: null, prune: false, logger);
+                RemoveLegacyInstall(installDir, logger);
                 progress.CloseWindow();
-                return 0;
+                return LaunchApp(Path.Combine(baseline.Path, DefaultEntryExe), installDir, Array.Empty<string>(), logger);
             }
 
             var manifestUrl = Environment.GetEnvironmentVariable(ManifestEnv);
@@ -87,12 +104,15 @@ static class Program
                 var manifest = FetchManifest(manifestUrl, logger);
                 if (manifest is not null)
                 {
-                    if (!InstallFromManifest(manifest, installDir, runtimeDir, stageDir, logger))
+                    var installed = InstallFromManifest(manifest, installDir, runtimeDir, stageDir, logger);
+                    if (installed is null)
                     {
                         ShowError("Update download failed and no baseline is available.");
                         return 1;
                     }
-                    return 0;
+                    PromoteInstalledApp(runtimeDir, installed, rollbackFolderName: null, prune: false, logger);
+                    RemoveLegacyInstall(installDir, logger);
+                    return LaunchApp(Path.Combine(installed.Path, DefaultEntryExe), installDir, Array.Empty<string>(), logger);
                 }
             }
 
@@ -114,7 +134,8 @@ static class Program
             if (manifest is not null && CompareVersions(manifest.Version, current.Version) > 0)
             {
                 logger.Info($"Cloud version is newer: {manifest.Version} (installed {current.Version})");
-                if (!InstallFromManifest(manifest, installDir, runtimeDir, stageDir, logger))
+                var installed = InstallFromManifest(manifest, installDir, runtimeDir, stageDir, logger);
+                if (installed is null)
                 {
                     var choice = MessageBox.Show(
                         "Update failed. Launch existing version?",
@@ -125,6 +146,16 @@ static class Program
                     {
                         return LaunchApp(currentExe, installDir, args, logger);
                     }
+                    return 1;
+                }
+                var rollbackTarget = ReadLastGood(runtimeDir, logger);
+                if (rollbackTarget is null || !IsValidInstalledApp(rollbackTarget.Path, DefaultEntryExe))
+                {
+                    rollbackTarget = current;
+                }
+                if (!PromoteCandidateAfterHealth(installed, rollbackTarget, installDir, runtimeDir, stageDir, logger))
+                {
+                    ShowError("Update rollback failed. Check launcher.log for details.");
                     return 1;
                 }
                 return 0;
@@ -139,7 +170,7 @@ static class Program
         return LaunchApp(currentExe, installDir, args, logger);
     }
 
-    private static bool InstallFromManifest(UpdateManifest manifest, string installDir, string runtimeDir, string stageDir, LauncherLogger logger)
+    private static InstalledApp? InstallFromManifest(UpdateManifest manifest, string installDir, string runtimeDir, string stageDir, LauncherLogger logger)
     {
         using var progress = new ProgressWindow("Updating MonitorSMS");
         progress.Show();
@@ -148,7 +179,7 @@ static class Program
         if (download is null)
         {
             progress.CloseWindow();
-            return false;
+            return null;
         }
 
         progress.SetStatus("Verifying signature...");
@@ -157,7 +188,7 @@ static class Program
         {
             SafeDelete(download);
             progress.CloseWindow();
-            return false;
+            return null;
         }
 
         if (!string.IsNullOrWhiteSpace(manifest.Sha256))
@@ -170,14 +201,14 @@ static class Program
                 logger.Warn("SHA256 mismatch, skipping update.");
                 SafeDelete(download);
                 progress.CloseWindow();
-                return false;
+                return null;
             }
         }
 
         progress.SetStatus("Extracting update...");
-        var ok = InstallFromZip(download, manifest.Version, installDir, runtimeDir, stageDir, manifest.EntryExe, cleanupZip: true, logger, progress);
+        var installed = InstallFromZip(download, manifest.Version, installDir, runtimeDir, stageDir, manifest.EntryExe, cleanupZip: true, logger, progress);
         progress.CloseWindow();
-        return ok;
+        return installed;
     }
 
     private static (string version, string path)? FindBaselineZip(string installDir)
@@ -359,7 +390,7 @@ static class Program
         }
     }
 
-    private static bool InstallFromZip(
+    private static InstalledApp? InstallFromZip(
         string zipPath,
         string version,
         string installDir,
@@ -370,7 +401,7 @@ static class Program
         LauncherLogger logger,
         ProgressWindow? progress)
     {
-        var succeeded = false;
+        InstalledApp? installed = null;
         string? stageRoot = null;
         try
         {
@@ -385,7 +416,7 @@ static class Program
             if (payloadRoot is null)
             {
                 logger.Warn($"Extracted payload missing {entryExe}.");
-                return false;
+                return null;
             }
 
             var sourceExe = Path.Combine(payloadRoot, entryExe);
@@ -393,7 +424,7 @@ static class Program
             if (!File.Exists(sourceExe) || !Directory.Exists(sourceInternal))
             {
                 logger.Warn("Extracted payload missing MonitorSMS.exe or _internal.");
-                return false;
+                return null;
             }
 
             var targetDir = Path.Combine(runtimeDir, $"{AppPrefix}{version}");
@@ -409,18 +440,14 @@ static class Program
             DirectoryCopy(sourceInternal, destInternal, true);
             File.Copy(sourceExe, destExe, overwrite: true);
 
-            WriteCurrent(runtimeDir, version, Path.GetFileName(targetDir), logger);
-            PruneRuntimeVersions(runtimeDir, Path.GetFileName(targetDir), logger);
-            RemoveLegacyInstall(installDir, logger);
             logger.Info($"Installed version {version} into {targetDir}");
-            LaunchApp(destExe, installDir, Array.Empty<string>(), logger);
-            succeeded = true;
-            return true;
+            installed = new InstalledApp(version, targetDir);
+            return installed;
         }
         catch (Exception ex)
         {
             logger.Warn($"Install failed: {ex.Message}");
-            return false;
+            return null;
         }
         finally
         {
@@ -434,10 +461,185 @@ static class Program
                 {
                 }
             }
-            if (cleanupZip && succeeded)
+            if (cleanupZip && installed is not null)
             {
                 SafeDelete(zipPath);
             }
+        }
+    }
+
+    private static bool PromoteCandidateAfterHealth(
+        InstalledApp candidate,
+        InstalledApp previousGood,
+        string installDir,
+        string runtimeDir,
+        string stageDir,
+        LauncherLogger logger)
+    {
+        var candidateExe = Path.Combine(candidate.Path, DefaultEntryExe);
+        logger.Info($"Launching candidate version {candidate.Version} for health verification.");
+        var health = LaunchAndWaitForCandidateHealth(candidate, candidateExe, installDir, stageDir, logger);
+        if (health.Succeeded)
+        {
+            logger.Info($"Candidate version {candidate.Version} passed the {CandidateHealthWindow.TotalSeconds:0}-second health window.");
+            PromoteInstalledApp(
+                runtimeDir,
+                candidate,
+                rollbackFolderName: Path.GetFileName(previousGood.Path),
+                prune: true,
+                logger);
+            RemoveLegacyInstall(installDir, logger);
+            SafeDelete(health.MarkerPath);
+            return true;
+        }
+
+        logger.Warn($"Candidate version {candidate.Version} failed health verification: {health.Reason}");
+        StopProcessTree(health.Process, logger);
+        WriteCurrent(runtimeDir, previousGood.Version, Path.GetFileName(previousGood.Path), logger);
+        WriteLastGood(runtimeDir, previousGood.Version, Path.GetFileName(previousGood.Path), logger);
+
+        var rollbackExe = Path.Combine(previousGood.Path, DefaultEntryExe);
+        logger.Warn($"Rolling back to last good version {previousGood.Version} at {previousGood.Path}.");
+        return LaunchApp(rollbackExe, installDir, Array.Empty<string>(), logger) == 0;
+    }
+
+    private static CandidateHealthResult LaunchAndWaitForCandidateHealth(
+        InstalledApp candidate,
+        string candidateExe,
+        string installDir,
+        string stageDir,
+        LauncherLogger logger)
+    {
+        Directory.CreateDirectory(stageDir);
+        var healthDir = Path.Combine(stageDir, "health");
+        Directory.CreateDirectory(healthDir);
+        var nonce = Guid.NewGuid().ToString("N");
+        var markerPath = Path.Combine(healthDir, $"candidate-health-{nonce}.json");
+        SafeDelete(markerPath);
+
+        var launchedAt = DateTimeOffset.UtcNow;
+        var env = new Dictionary<string, string>
+        {
+            [LauncherHealthPathEnv] = markerPath,
+            [LauncherHealthNonceEnv] = nonce,
+            [LauncherHealthVersionEnv] = candidate.Version,
+            [LauncherRequireFreshDbEnv] = "1"
+        };
+        var process = StartAppProcess(candidateExe, installDir, Array.Empty<string>(), logger, env);
+        if (process is null)
+        {
+            return new CandidateHealthResult(false, "Candidate process failed to start.", null, markerPath);
+        }
+
+        var deadline = launchedAt + CandidateHealthWindow;
+        var healthySeen = false;
+        var lastReason = "Health marker was not written.";
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            Application.DoEvents();
+            if (File.Exists(markerPath))
+            {
+                var marker = ReadCandidateHealthMarker(markerPath, candidate.Version, nonce, launchedAt, requireFreshDb: true, logger);
+                if (marker.State == HealthMarkerState.Invalid || marker.State == HealthMarkerState.Unhealthy)
+                {
+                    return new CandidateHealthResult(false, marker.Reason, process, markerPath);
+                }
+                if (marker.State == HealthMarkerState.Healthy)
+                {
+                    healthySeen = true;
+                    lastReason = marker.Reason;
+                }
+            }
+
+            if (process.HasExited)
+            {
+                return new CandidateHealthResult(false, $"Candidate process exited before promotion. {lastReason}", process, markerPath);
+            }
+            Thread.Sleep(500);
+        }
+
+        if (!healthySeen)
+        {
+            return new CandidateHealthResult(false, lastReason, process, markerPath);
+        }
+        if (process.HasExited)
+        {
+            return new CandidateHealthResult(false, "Candidate process exited at the end of the health window.", process, markerPath);
+        }
+        return new CandidateHealthResult(true, "Candidate stayed healthy through the promotion window.", process, markerPath);
+    }
+
+    private static HealthMarkerResult ReadCandidateHealthMarker(
+        string markerPath,
+        string expectedVersion,
+        string expectedNonce,
+        DateTimeOffset launchedAt,
+        bool requireFreshDb,
+        LauncherLogger logger)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(markerPath, Encoding.UTF8));
+            var root = doc.RootElement;
+            var version = root.TryGetProperty("version", out var versionElement) ? versionElement.GetString() : null;
+            var nonce = root.TryGetProperty("nonce", out var nonceElement) ? nonceElement.GetString() : null;
+            if (!string.Equals(version, expectedVersion, StringComparison.OrdinalIgnoreCase))
+            {
+                return new HealthMarkerResult(HealthMarkerState.Invalid, "Health marker version did not match the candidate version.");
+            }
+            if (!string.Equals(nonce, expectedNonce, StringComparison.Ordinal))
+            {
+                return new HealthMarkerResult(HealthMarkerState.Invalid, "Health marker nonce did not match this launch.");
+            }
+
+            if (!root.TryGetProperty("reported_at_utc", out var reportedAtElement) ||
+                !DateTimeOffset.TryParse(reportedAtElement.GetString(), out var reportedAt))
+            {
+                return new HealthMarkerResult(HealthMarkerState.Invalid, "Health marker is missing a valid reported_at_utc value.");
+            }
+            if (reportedAt < launchedAt.AddSeconds(-5))
+            {
+                return new HealthMarkerResult(HealthMarkerState.Invalid, "Health marker was older than this candidate launch.");
+            }
+
+            var status = root.TryGetProperty("status", out var statusElement) ? statusElement.GetString() : null;
+            var reason = root.TryGetProperty("reason", out var reasonElement) ? reasonElement.GetString() : null;
+            if (string.Equals(status, "unhealthy", StringComparison.OrdinalIgnoreCase))
+            {
+                return new HealthMarkerResult(HealthMarkerState.Unhealthy, string.IsNullOrWhiteSpace(reason) ? "Candidate app reported unhealthy startup." : reason!);
+            }
+            if (!string.Equals(status, "healthy", StringComparison.OrdinalIgnoreCase))
+            {
+                return new HealthMarkerResult(HealthMarkerState.Invalid, "Health marker status was not healthy.");
+            }
+
+            if (requireFreshDb)
+            {
+                var freshEstaciones = root.TryGetProperty("fresh_estaciones", out var estacionesElement) &&
+                    estacionesElement.ValueKind == JsonValueKind.True;
+                var freshReportes = root.TryGetProperty("fresh_reportes", out var reportesElement) &&
+                    reportesElement.ValueKind == JsonValueKind.True;
+                if (!freshEstaciones || !freshReportes)
+                {
+                    return new HealthMarkerResult(HealthMarkerState.Unhealthy, "Candidate did not freshly download estaciones.db and reportes.db.");
+                }
+            }
+
+            return new HealthMarkerResult(HealthMarkerState.Healthy, string.IsNullOrWhiteSpace(reason) ? "Candidate reported healthy startup." : reason!);
+        }
+        catch (IOException ex)
+        {
+            logger.Warn($"Unable to read candidate health marker yet: {ex.Message}");
+            return new HealthMarkerResult(HealthMarkerState.Pending, "Health marker is not readable yet.");
+        }
+        catch (JsonException ex)
+        {
+            logger.Warn($"Candidate health marker is not valid JSON yet: {ex.Message}");
+            return new HealthMarkerResult(HealthMarkerState.Pending, "Health marker is not parseable yet.");
+        }
+        catch (Exception ex)
+        {
+            return new HealthMarkerResult(HealthMarkerState.Invalid, $"Health marker rejected: {ex.Message}");
         }
     }
 
@@ -477,10 +679,20 @@ static class Program
 
     private static int LaunchApp(string appExe, string installDir, string[] args, LauncherLogger logger)
     {
+        return StartAppProcess(appExe, installDir, args, logger, environment: null) is null ? 1 : 0;
+    }
+
+    private static Process? StartAppProcess(
+        string appExe,
+        string installDir,
+        string[] args,
+        LauncherLogger logger,
+        IReadOnlyDictionary<string, string>? environment)
+    {
         if (!File.Exists(appExe))
         {
             logger.Error($"Executable not found: {appExe}");
-            return 1;
+            return null;
         }
         try
         {
@@ -494,13 +706,40 @@ static class Program
             {
                 startInfo.ArgumentList.Add(arg);
             }
-            Process.Start(startInfo);
-            return 0;
+            if (environment is not null)
+            {
+                foreach (var item in environment)
+                {
+                    startInfo.Environment[item.Key] = item.Value;
+                }
+            }
+            return Process.Start(startInfo);
         }
         catch (Exception ex)
         {
             logger.Error($"Failed to launch app: {ex.Message}");
-            return 1;
+            return null;
+        }
+    }
+
+    private static void StopProcessTree(Process? process, LauncherLogger logger)
+    {
+        if (process is null)
+        {
+            return;
+        }
+        try
+        {
+            if (!process.HasExited)
+            {
+                logger.Warn($"Stopping failed candidate process (PID {process.Id}).");
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(5000);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.Warn($"Failed to stop candidate process: {ex.Message}");
         }
     }
 
@@ -617,6 +856,53 @@ static class Program
         }
     }
 
+    private static void WriteLastGood(string runtimeDir, string version, string folderName, LauncherLogger logger)
+    {
+        try
+        {
+            Directory.CreateDirectory(runtimeDir);
+            var payload = JsonSerializer.Serialize(new
+            {
+                version,
+                path = folderName,
+                promoted_at_utc = DateTimeOffset.UtcNow.ToString("O")
+            });
+            File.WriteAllText(Path.Combine(runtimeDir, LastGoodFile), payload);
+        }
+        catch (Exception ex)
+        {
+            logger.Warn($"Failed to write last_good.json: {ex.Message}");
+        }
+    }
+
+    private static void PromoteInstalledApp(
+        string runtimeDir,
+        InstalledApp app,
+        string? rollbackFolderName,
+        bool prune,
+        LauncherLogger logger)
+    {
+        var folderName = Path.GetFileName(app.Path);
+        WriteCurrent(runtimeDir, app.Version, folderName, logger);
+        WriteLastGood(runtimeDir, app.Version, folderName, logger);
+        if (prune)
+        {
+            PruneRuntimeVersions(runtimeDir, folderName, rollbackFolderName, logger);
+        }
+    }
+
+    private static void EnsureLastGood(string runtimeDir, InstalledApp current, LauncherLogger logger)
+    {
+        var lastGood = ReadLastGood(runtimeDir, logger);
+        if (lastGood is not null && IsValidInstalledApp(lastGood.Path, DefaultEntryExe))
+        {
+            return;
+        }
+
+        logger.Info($"Seeding last_good.json from current version {current.Version}.");
+        WriteLastGood(runtimeDir, current.Version, Path.GetFileName(current.Path), logger);
+    }
+
     private static InstalledApp? ReadCurrent(string runtimeDir, LauncherLogger logger)
     {
         var path = Path.Combine(runtimeDir, CurrentFile);
@@ -656,6 +942,49 @@ static class Program
         catch (Exception ex)
         {
             logger.Warn($"Failed to read current.json: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static InstalledApp? ReadLastGood(string runtimeDir, LauncherLogger logger)
+    {
+        var path = Path.Combine(runtimeDir, LastGoodFile);
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+        try
+        {
+            var json = File.ReadAllText(path);
+            var doc = JsonDocument.Parse(json);
+            var version = doc.RootElement.TryGetProperty("version", out var v) ? v.GetString() : null;
+            var relPath = doc.RootElement.TryGetProperty("path", out var p) ? p.GetString() : null;
+            if (string.IsNullOrWhiteSpace(version))
+            {
+                return null;
+            }
+
+            if (string.IsNullOrWhiteSpace(relPath))
+            {
+                relPath = $"{AppPrefix}{version}";
+            }
+
+            if (!string.IsNullOrWhiteSpace(relPath) && Path.IsPathRooted(relPath))
+            {
+                relPath = Path.GetFileName(relPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            }
+
+            if (string.IsNullOrWhiteSpace(relPath))
+            {
+                relPath = $"{AppPrefix}{version}";
+            }
+
+            var fullPath = Path.Combine(runtimeDir, relPath);
+            return new InstalledApp(version, fullPath);
+        }
+        catch (Exception ex)
+        {
+            logger.Warn($"Failed to read last_good.json: {ex.Message}");
             return null;
         }
     }
@@ -734,17 +1063,27 @@ static class Program
         return best;
     }
 
-    private static void PruneRuntimeVersions(string runtimeDir, string keepFolderName, LauncherLogger logger)
+    private static void PruneRuntimeVersions(string runtimeDir, string currentFolderName, string? rollbackFolderName, LauncherLogger logger)
     {
         if (!Directory.Exists(runtimeDir))
         {
             return;
         }
 
+        rollbackFolderName = ResolveRollbackFolder(runtimeDir, currentFolderName, rollbackFolderName);
+        var keepFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            currentFolderName
+        };
+        if (!string.IsNullOrWhiteSpace(rollbackFolderName))
+        {
+            keepFolders.Add(rollbackFolderName);
+        }
+
         foreach (var dir in Directory.GetDirectories(runtimeDir, $"{AppPrefix}*"))
         {
             var name = Path.GetFileName(dir);
-            if (string.Equals(name, keepFolderName, StringComparison.OrdinalIgnoreCase))
+            if (!string.IsNullOrWhiteSpace(name) && keepFolders.Contains(name))
             {
                 continue;
             }
@@ -757,6 +1096,47 @@ static class Program
                 logger.Warn($"Failed to remove old runtime folder {dir}: {ex.Message}");
             }
         }
+    }
+
+    private static string? ResolveRollbackFolder(string runtimeDir, string currentFolderName, string? requestedRollbackFolderName)
+    {
+        if (!string.IsNullOrWhiteSpace(requestedRollbackFolderName))
+        {
+            var requestedPath = Path.Combine(runtimeDir, requestedRollbackFolderName);
+            if (!string.Equals(requestedRollbackFolderName, currentFolderName, StringComparison.OrdinalIgnoreCase) &&
+                IsValidInstalledApp(requestedPath, DefaultEntryExe))
+            {
+                return requestedRollbackFolderName;
+            }
+        }
+
+        var currentVersion = currentFolderName.StartsWith(AppPrefix, StringComparison.OrdinalIgnoreCase)
+            ? currentFolderName[AppPrefix.Length..]
+            : "";
+        InstalledApp? bestPrevious = null;
+        InstalledApp? bestFallback = null;
+        foreach (var app in ScanInstalled(runtimeDir))
+        {
+            var folderName = Path.GetFileName(app.Path);
+            if (string.Equals(folderName, currentFolderName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+            if (bestFallback is null || CompareVersions(app.Version, bestFallback.Version) > 0)
+            {
+                bestFallback = app;
+            }
+            if (!string.IsNullOrWhiteSpace(currentVersion) && CompareVersions(app.Version, currentVersion) < 0)
+            {
+                if (bestPrevious is null || CompareVersions(app.Version, bestPrevious.Version) > 0)
+                {
+                    bestPrevious = app;
+                }
+            }
+        }
+
+        var selected = bestPrevious ?? bestFallback;
+        return selected is null ? null : Path.GetFileName(selected.Path);
     }
 
     private static void RemoveLegacyInstall(string installDir, LauncherLogger logger)
@@ -821,7 +1201,8 @@ static class Program
             }
 
             WriteCurrent(runtimeDir, version, Path.GetFileName(targetDir), logger);
-            PruneRuntimeVersions(runtimeDir, Path.GetFileName(targetDir), logger);
+            WriteLastGood(runtimeDir, version, Path.GetFileName(targetDir), logger);
+            PruneRuntimeVersions(runtimeDir, Path.GetFileName(targetDir), rollbackFolderName: null, logger);
             RemoveLegacyInstall(installDir, logger);
             logger.Info($"Migrated legacy install to {targetDir}");
             return new InstalledApp(version, targetDir);
@@ -1104,6 +1485,16 @@ static class Program
         }
     }
 
+    private enum HealthMarkerState
+    {
+        Pending,
+        Healthy,
+        Unhealthy,
+        Invalid
+    }
+
+    private sealed record CandidateHealthResult(bool Succeeded, string Reason, Process? Process, string MarkerPath);
+    private sealed record HealthMarkerResult(HealthMarkerState State, string Reason);
     private sealed record InstalledApp(string Version, string Path);
     private sealed record UpdateManifest(string Version, string Url, string? Sha256, string EntryExe, string SignatureUrl);
 }
