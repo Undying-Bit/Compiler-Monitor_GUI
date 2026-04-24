@@ -51,6 +51,8 @@ if (-not $Version) {
 
 $outDir = $paths.ArtifactsPath
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+$manifestsDir = Join-Path $outDir "manifests"
+New-Item -ItemType Directory -Path $manifestsDir -Force | Out-Null
 
 $trimmedBaseUrl = $BaseUrl.TrimEnd("/")
 $zipName = "MonitorSMS-$Version.zip"
@@ -58,6 +60,8 @@ $zipPath = Join-Path $outDir $zipName
 $zipSignaturePath = "$zipPath.sig"
 $manifestPath = Join-Path $outDir "latest.json"
 $manifestSignaturePath = "$manifestPath.sig"
+$archivedManifestPath = Join-Path $manifestsDir "MonitorSMS-$Version.json"
+$archivedManifestSignaturePath = "$archivedManifestPath.sig"
 
 foreach ($artifact in @($zipPath, $zipSignaturePath, $manifestPath, $manifestSignaturePath)) {
     if (Test-Path $artifact) {
@@ -108,7 +112,12 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+Copy-Item -Path $manifestPath -Destination $archivedManifestPath -Force
+Copy-Item -Path $manifestSignaturePath -Destination $archivedManifestSignaturePath -Force
+
 Write-Host "Wrote $zipPath"
 Write-Host "Wrote $zipSignaturePath"
 Write-Host "Wrote $manifestPath"
 Write-Host "Wrote $manifestSignaturePath"
+Write-Host "Archived $archivedManifestPath"
+Write-Host "Archived $archivedManifestSignaturePath"

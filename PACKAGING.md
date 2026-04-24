@@ -10,7 +10,7 @@ The packaging flow is now fail-closed:
 - update manifests and ZIPs must be detached-signed
 - launcher builds require an embedded public verification key
 - upload scripts no longer read repo-local secret files
-- update uploads no longer purge the bucket
+- update uploads prune old remote update artifacts before uploading the new set
 
 ## Source Resolution
 
@@ -110,6 +110,11 @@ Then fill in the values needed by each workflow:
 - `latest.json`
 - `latest.json.sig`
 
+It also archives rollback manifests under `packaging/artifacts/manifests/` as:
+
+- `MonitorSMS-<version>.json`
+- `MonitorSMS-<version>.json.sig`
+
 The manifest includes:
 
 ```json
@@ -168,7 +173,7 @@ Query-string token auth is no longer supported.
 
 ## Uploading Updates
 
-`upload-update.ps1` now uploads four files:
+`upload-update.ps1` now uploads four files after pruning existing remote update artifacts in the same prefix:
 
 - `latest.json`
 - `latest.json.sig`
@@ -181,7 +186,14 @@ It validates that:
 - `latest.json.signature_url` matches the ZIP signature file name
 - the signature sidecar files exist before upload
 
-It does not delete existing bucket contents.
+Before upload, it deletes only recognized update artifacts in the configured prefix:
+
+- `latest.json`
+- `latest.json.sig`
+- `MonitorSMS-<version>.zip`
+- `MonitorSMS-<version>.zip.sig`
+
+It does not delete unrelated objects such as `/data/*` payloads or nested archive folders.
 
 Credentials must come from environment variables or explicit parameters:
 
@@ -190,6 +202,16 @@ Credentials must come from environment variables or explicit parameters:
 - `UPDATE_R2_ACCESS_KEY`
 - `UPDATE_R2_SECRET_KEY`
 - optional `UPDATE_R2_REGION`, `UPDATE_R2_SESSION_TOKEN`, `UPDATE_R2_PREFIX`
+
+## Rollback Workflow
+
+To roll back the remote update feed to an older packaged build:
+
+1. Choose the archived manifest pair from `packaging/artifacts/manifests/`.
+2. Copy `MonitorSMS-<version>.json` to `packaging/artifacts/latest.json`.
+3. Copy `MonitorSMS-<version>.json.sig` to `packaging/artifacts/latest.json.sig`.
+4. Ensure the matching `MonitorSMS-<version>.zip` and `MonitorSMS-<version>.zip.sig` are present in `packaging/artifacts/`.
+5. Run `run-upload-update.bat` to prune the remote update artifacts and publish the rollback set.
 
 ## Build Hygiene
 
