@@ -70,6 +70,8 @@ class UploadUpdateTest(unittest.TestCase):
                         {"Key": "updates/latest.json.sig"},
                         {"Key": "updates/MonitorSMS-0.2.14.zip"},
                         {"Key": "updates/MonitorSMS-0.2.14.zip.sig"},
+                        {"Key": "updates/MonitorSMS-0.2.13-to-0.2.14-patch.zip"},
+                        {"Key": "updates/MonitorSMS-0.2.13-to-0.2.14-patch.zip.sig"},
                         {"Key": "updates/MonitorSMS-0.2.14.msi"},
                         {"Key": "updates/archive/latest.json"},
                         {"Key": "updates/archive/MonitorSMS-0.2.13.zip"},
@@ -90,6 +92,8 @@ class UploadUpdateTest(unittest.TestCase):
                 "updates/latest.json.sig",
                 "updates/MonitorSMS-0.2.14.zip",
                 "updates/MonitorSMS-0.2.14.zip.sig",
+                "updates/MonitorSMS-0.2.13-to-0.2.14-patch.zip",
+                "updates/MonitorSMS-0.2.13-to-0.2.14-patch.zip.sig",
             ],
         )
         self.assertEqual(
@@ -103,6 +107,8 @@ class UploadUpdateTest(unittest.TestCase):
                             {"Key": "updates/latest.json.sig"},
                             {"Key": "updates/MonitorSMS-0.2.14.zip"},
                             {"Key": "updates/MonitorSMS-0.2.14.zip.sig"},
+                            {"Key": "updates/MonitorSMS-0.2.13-to-0.2.14-patch.zip"},
+                            {"Key": "updates/MonitorSMS-0.2.13-to-0.2.14-patch.zip.sig"},
                         ],
                         "Quiet": True,
                     },
@@ -110,7 +116,7 @@ class UploadUpdateTest(unittest.TestCase):
             ],
         )
 
-    def test_publish_update_artifacts_prunes_before_uploading_expected_four_files(self) -> None:
+    def test_publish_update_artifacts_prunes_before_uploading_expected_six_files_when_patch_present(self) -> None:
         client = FakeS3Client([{"Contents": [{"Key": "updates/MonitorSMS-0.2.13.zip"}]}])
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -119,11 +125,15 @@ class UploadUpdateTest(unittest.TestCase):
             latest_sig = tmp_path / "latest.json.sig"
             zip_path = tmp_path / "MonitorSMS-0.2.14.zip"
             zip_sig = tmp_path / "MonitorSMS-0.2.14.zip.sig"
+            patch_path = tmp_path / "MonitorSMS-0.2.13-to-0.2.14-patch.zip"
+            patch_sig = tmp_path / "MonitorSMS-0.2.13-to-0.2.14-patch.zip.sig"
 
             latest.write_text('{"version":"0.2.14"}\n', encoding="utf-8")
             latest_sig.write_bytes(b"manifest-signature")
             zip_path.write_bytes(b"zip-payload")
             zip_sig.write_bytes(b"zip-signature")
+            patch_path.write_bytes(b"patch-payload")
+            patch_sig.write_bytes(b"patch-signature")
 
             deleted, uploaded = upload_update.publish_update_artifacts(
                 client,
@@ -133,6 +143,8 @@ class UploadUpdateTest(unittest.TestCase):
                 latest_sig_path=latest_sig,
                 zip_path=zip_path,
                 zip_sig_path=zip_sig,
+                patch_path=patch_path,
+                patch_sig_path=patch_sig,
             )
 
         self.assertEqual(deleted, ["updates/MonitorSMS-0.2.13.zip"])
@@ -143,6 +155,8 @@ class UploadUpdateTest(unittest.TestCase):
                 "updates/latest.json.sig",
                 "updates/MonitorSMS-0.2.14.zip",
                 "updates/MonitorSMS-0.2.14.zip.sig",
+                "updates/MonitorSMS-0.2.13-to-0.2.14-patch.zip",
+                "updates/MonitorSMS-0.2.13-to-0.2.14-patch.zip.sig",
             ],
         )
         self.assertEqual(
@@ -153,11 +167,15 @@ class UploadUpdateTest(unittest.TestCase):
                 ("upload", "updates/latest.json.sig"),
                 ("upload", "updates/MonitorSMS-0.2.14.zip"),
                 ("upload", "updates/MonitorSMS-0.2.14.zip.sig"),
+                ("upload", "updates/MonitorSMS-0.2.13-to-0.2.14-patch.zip"),
+                ("upload", "updates/MonitorSMS-0.2.13-to-0.2.14-patch.zip.sig"),
             ],
         )
-        self.assertEqual(len(client.uploads), 4)
+        self.assertEqual(len(client.uploads), 6)
         self.assertEqual(client.uploads[2]["extra_args"]["ContentType"], "application/zip")
         self.assertIn("sha256", client.uploads[2]["extra_args"]["Metadata"])
+        self.assertEqual(client.uploads[4]["extra_args"]["ContentType"], "application/zip")
+        self.assertIn("sha256", client.uploads[4]["extra_args"]["Metadata"])
 
     def test_prune_update_artifacts_fails_closed_when_delete_reports_errors(self) -> None:
         client = ErroringDeleteClient([{"Contents": [{"Key": "updates/latest.json"}]}])

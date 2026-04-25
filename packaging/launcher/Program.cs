@@ -104,7 +104,7 @@ static class Program
                 var manifest = FetchManifest(manifestUrl, logger);
                 if (manifest is not null)
                 {
-                    var installed = InstallFromManifest(manifest, installDir, runtimeDir, stageDir, logger);
+                    var installed = InstallFromManifest(manifest, installDir, runtimeDir, stageDir, current: null, logger);
                     if (installed is null)
                     {
                         ShowError("Update download failed and no baseline is available.");
@@ -134,7 +134,7 @@ static class Program
             if (manifest is not null && CompareVersions(manifest.Version, current.Version) > 0)
             {
                 logger.Info($"Cloud version is newer: {manifest.Version} (installed {current.Version})");
-                var installed = InstallFromManifest(manifest, installDir, runtimeDir, stageDir, logger);
+                var installed = InstallFromManifest(manifest, installDir, runtimeDir, stageDir, current, logger);
                 if (installed is null)
                 {
                     var choice = MessageBox.Show(
@@ -170,45 +170,412 @@ static class Program
         return LaunchApp(currentExe, installDir, args, logger);
     }
 
-    private static InstalledApp? InstallFromManifest(UpdateManifest manifest, string installDir, string runtimeDir, string stageDir, LauncherLogger logger)
+    private static InstalledApp? InstallFromManifest(
+        UpdateManifest manifest,
+        string installDir,
+        string runtimeDir,
+        string stageDir,
+        InstalledApp? current,
+        LauncherLogger logger)
     {
         using var progress = new ProgressWindow("Updating MonitorSMS");
         progress.Show();
-        progress.SetStatus("Downloading update...");
-        var download = DownloadToStage(manifest.Url, stageDir, logger, progress);
+        logger.Info(
+            manifest.Patch is null
+                ? $"Preparing update install for version {manifest.Version} using full ZIP only."
+                : $"Preparing update install for version {manifest.Version}; patch baseline is {manifest.Patch.FromVersion}.");
+        InstalledApp? installed = null;
+        if (current is not null &&
+            manifest.Patch is not null &&
+            string.Equals(current.Version, manifest.Patch.FromVersion, StringComparison.OrdinalIgnoreCase))
+        {
+            logger.Info($"Installed version {current.Version} matches patch baseline {manifest.Patch.FromVersion}; attempting patch update.");
+            installed = InstallFromPatch(manifest, manifest.Patch, current, installDir, runtimeDir, stageDir, logger, progress);
+            if (installed is not null)
+            {
+                progress.CloseWindow();
+                return installed;
+            }
+
+            logger.Warn($"Patch update from {manifest.Patch.FromVersion} to {manifest.Version} failed; falling back to full ZIP.");
+        }
+        else if (current is not null && manifest.Patch is not null)
+        {
+            logger.Info($"Installed version {current.Version} does not match patch baseline {manifest.Patch.FromVersion}; using full ZIP.");
+        }
+        else if (current is null)
+        {
+            logger.Info("No installed runtime version is available for patch eligibility; using full ZIP.");
+        }
+
+        var fullArtifact = new UpdateArtifact(manifest.Url, manifest.Sha256, manifest.SignatureUrl);
+        installed = InstallFromZipArtifact(fullArtifact, "full update", manifest.Version, installDir, runtimeDir, stageDir, manifest.EntryExe, logger, progress);
+        progress.CloseWindow();
+        return installed;
+    }
+
+    private static InstalledApp? InstallFromZipArtifact(
+        UpdateArtifact artifact,
+        string label,
+        string version,
+        string installDir,
+        string runtimeDir,
+        string stageDir,
+        string entryExe,
+        LauncherLogger logger,
+        ProgressWindow? progress)
+    {
+        var download = DownloadVerifiedArtifact(artifact, label, stageDir, logger, progress);
         if (download is null)
         {
-            progress.CloseWindow();
             return null;
         }
 
-        progress.SetStatus("Verifying signature...");
-        progress.SetIndeterminate();
-        if (!VerifyFileSignature(download, manifest.SignatureUrl, logger))
+        progress?.SetStatus("Extracting update...");
+        logger.Info($"Applying {label} for target version {version} using entry executable {entryExe}.");
+        return InstallFromZip(download, version, installDir, runtimeDir, stageDir, entryExe, cleanupZip: true, logger, progress);
+    }
+
+    private static InstalledApp? InstallFromPatch(
+        UpdateManifest manifest,
+        PatchArtifact patch,
+        InstalledApp current,
+        string installDir,
+        string runtimeDir,
+        string stageDir,
+        LauncherLogger logger,
+        ProgressWindow? progress)
+    {
+        logger.Info($"Starting patch install from version {current.Version} to {manifest.Version} using {patch.Url}.");
+        var download = DownloadVerifiedArtifact(
+            new UpdateArtifact(patch.Url, patch.Sha256, patch.SignatureUrl),
+            "patch update",
+            stageDir,
+            logger,
+            progress);
+        if (download is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            progress?.SetStatus("Applying patch update...");
+            return InstallFromPatchZip(download, manifest.Version, patch.FromVersion, current, runtimeDir, stageDir, logger, progress);
+        }
+        finally
         {
             SafeDelete(download);
-            progress.CloseWindow();
+        }
+    }
+
+    private static string? DownloadVerifiedArtifact(
+        UpdateArtifact artifact,
+        string label,
+        string stageDir,
+        LauncherLogger logger,
+        ProgressWindow? progress)
+    {
+        logger.Info($"Downloading {label} from {artifact.Url}.");
+        progress?.SetStatus($"Downloading {label}...");
+        var download = DownloadToStage(artifact.Url, stageDir, logger, progress);
+        if (download is null)
+        {
             return null;
         }
 
-        if (!string.IsNullOrWhiteSpace(manifest.Sha256))
+        logger.Info($"Downloaded {label} to temporary file {download}.");
+        progress?.SetStatus("Verifying signature...");
+        progress?.SetIndeterminate();
+        if (!VerifyFileSignature(download, artifact.SignatureUrl, logger))
         {
-            progress.SetStatus("Verifying download...");
-            progress.SetIndeterminate();
+            SafeDelete(download);
+            return null;
+        }
+        logger.Info($"Verified detached signature for {label}.");
+
+        if (!string.IsNullOrWhiteSpace(artifact.Sha256))
+        {
+            progress?.SetStatus("Verifying download...");
+            progress?.SetIndeterminate();
             var digest = Sha256File(download);
-            if (!digest.Equals(manifest.Sha256, StringComparison.OrdinalIgnoreCase))
+            if (!digest.Equals(artifact.Sha256, StringComparison.OrdinalIgnoreCase))
             {
                 logger.Warn("SHA256 mismatch, skipping update.");
                 SafeDelete(download);
-                progress.CloseWindow();
                 return null;
+            }
+            logger.Info($"Verified SHA256 for {label}: {digest}.");
+        }
+        else
+        {
+            logger.Info($"No SHA256 was provided for {label}; signature verification only.");
+        }
+
+        return download;
+    }
+
+    private static InstalledApp? InstallFromPatchZip(
+        string patchZipPath,
+        string version,
+        string expectedFromVersion,
+        InstalledApp current,
+        string runtimeDir,
+        string stageDir,
+        LauncherLogger logger,
+        ProgressWindow? progress)
+    {
+        InstalledApp? installed = null;
+        string? stageRoot = null;
+        string? targetDir = null;
+        try
+        {
+            CloseRunningApp(DefaultEntryExe, logger);
+            Directory.CreateDirectory(stageDir);
+            stageRoot = Path.Combine(stageDir, Guid.NewGuid().ToString("N"));
+            var extractRoot = Path.Combine(stageRoot, "extract");
+            Directory.CreateDirectory(extractRoot);
+            ExtractZipWithProgress(patchZipPath, extractRoot, progress, logger);
+
+            var patchMetadata = ReadPatchMetadata(extractRoot, logger);
+            if (patchMetadata is null)
+            {
+                return null;
+            }
+            logger.Info(
+                $"Loaded patch metadata from {patchMetadata.FromVersion} to {patchMetadata.ToVersion} with {patchMetadata.DeletePaths.Length} delete path(s).");
+
+            if (!string.Equals(patchMetadata.FromVersion, expectedFromVersion, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(patchMetadata.FromVersion, current.Version, StringComparison.OrdinalIgnoreCase))
+            {
+                logger.Warn($"Patch baseline version mismatch. Expected {expectedFromVersion}, found {patchMetadata.FromVersion}.");
+                return null;
+            }
+
+            if (!string.Equals(patchMetadata.ToVersion, version, StringComparison.OrdinalIgnoreCase))
+            {
+                logger.Warn($"Patch target version mismatch. Expected {version}, found {patchMetadata.ToVersion}.");
+                return null;
+            }
+
+            targetDir = Path.Combine(runtimeDir, $"{AppPrefix}{version}");
+            if (Directory.Exists(targetDir))
+            {
+                Directory.Delete(targetDir, recursive: true);
+            }
+
+            progress?.SetStatus("Preparing base files...");
+            progress?.SetIndeterminate();
+            logger.Info($"Copying existing runtime from {current.Path} into candidate folder {targetDir}.");
+            DirectoryCopy(current.Path, targetDir, true);
+
+            progress?.SetStatus("Applying patch files...");
+            progress?.SetIndeterminate();
+            var overlaidFiles = OverlayDirectory(extractRoot, targetDir, logger);
+            var deletedPaths = ApplyDeletePaths(targetDir, patchMetadata.DeletePaths, logger);
+            logger.Info($"Applied {overlaidFiles} patched file(s) and removed {deletedPaths} stale path(s) for version {version}.");
+
+            var entryExe = patchMetadata.EntryExe;
+            if (string.IsNullOrWhiteSpace(entryExe))
+            {
+                logger.Warn("Patch metadata is missing entry_exe.");
+                return null;
+            }
+
+            if (!IsValidInstalledApp(targetDir, entryExe))
+            {
+                logger.Warn($"Patched payload missing {entryExe} or _internal.");
+                return null;
+            }
+
+            logger.Info($"Installed patched version {version} into {targetDir}");
+            installed = new InstalledApp(version, targetDir);
+            return installed;
+        }
+        catch (Exception ex)
+        {
+            logger.Warn($"Patch install failed: {ex.Message}");
+            return null;
+        }
+        finally
+        {
+            if (installed is null && targetDir is not null)
+            {
+                try
+                {
+                    if (Directory.Exists(targetDir))
+                    {
+                        logger.Warn($"Removing incomplete patched candidate folder {targetDir}.");
+                        Directory.Delete(targetDir, recursive: true);
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            if (stageRoot is not null)
+            {
+                try
+                {
+                    logger.Info($"Cleaning patch staging folder {stageRoot}.");
+                    Directory.Delete(stageRoot, recursive: true);
+                }
+                catch
+                {
+                }
+            }
+        }
+    }
+
+    private static PatchPackage? ReadPatchMetadata(string extractRoot, LauncherLogger logger)
+    {
+        var patchMetadataPath = Path.Combine(extractRoot, "patch.json");
+        if (!File.Exists(patchMetadataPath))
+        {
+            logger.Warn("Patch payload is missing patch.json.");
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(patchMetadataPath, Encoding.UTF8));
+            var root = doc.RootElement;
+            var fromVersion = root.TryGetProperty("from_version", out var fromElement) ? fromElement.GetString() : null;
+            var toVersion = root.TryGetProperty("to_version", out var toElement) ? toElement.GetString() : null;
+            var entryExe = root.TryGetProperty("entry_exe", out var entryElement) ? entryElement.GetString() : null;
+            if (string.IsNullOrWhiteSpace(fromVersion) || string.IsNullOrWhiteSpace(toVersion) || string.IsNullOrWhiteSpace(entryExe))
+            {
+                logger.Warn("Patch metadata is missing from_version, to_version, or entry_exe.");
+                return null;
+            }
+
+            var deletePaths = new List<string>();
+            if (root.TryGetProperty("delete_paths", out var deleteElement))
+            {
+                if (deleteElement.ValueKind != JsonValueKind.Array)
+                {
+                    logger.Warn("Patch metadata delete_paths is not an array.");
+                    return null;
+                }
+
+                foreach (var item in deleteElement.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.String)
+                    {
+                        logger.Warn("Patch metadata delete_paths contains a non-string entry.");
+                        return null;
+                    }
+
+                    var deletePath = item.GetString();
+                    if (!string.IsNullOrWhiteSpace(deletePath))
+                    {
+                        deletePaths.Add(deletePath);
+                    }
+                }
+            }
+
+            logger.Info(
+                $"Patch metadata validated for {fromVersion} -> {toVersion} with entry executable {entryExe} and {deletePaths.Count} delete path(s).");
+            return new PatchPackage(fromVersion!, toVersion!, entryExe!, deletePaths.ToArray());
+        }
+        catch (Exception ex)
+        {
+            logger.Warn($"Failed to read patch metadata: {ex.Message}");
+            return null;
+        }
+    }
+
+    private static int OverlayDirectory(string sourceRoot, string targetRoot, LauncherLogger logger)
+    {
+        var copiedFiles = 0;
+        foreach (var file in Directory.GetFiles(sourceRoot, "*", SearchOption.AllDirectories))
+        {
+            var relativePath = Path.GetRelativePath(sourceRoot, file);
+            if (string.Equals(relativePath, "patch.json", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var destination = ResolveRelativePathWithinRoot(targetRoot, relativePath);
+            if (destination is null)
+            {
+                logger.Warn($"Patch file rejected due to invalid relative path: {relativePath}");
+                throw new InvalidDataException($"Patch file escapes runtime directory: {relativePath}");
+            }
+
+            var destinationDir = Path.GetDirectoryName(destination);
+            if (!string.IsNullOrEmpty(destinationDir))
+            {
+                Directory.CreateDirectory(destinationDir);
+            }
+
+            File.Copy(file, destination, overwrite: true);
+            copiedFiles++;
+        }
+
+        return copiedFiles;
+    }
+
+    private static int ApplyDeletePaths(string targetRoot, string[] deletePaths, LauncherLogger logger)
+    {
+        var removedPaths = 0;
+        Array.Sort(deletePaths, (left, right) =>
+        {
+            var leftDepth = CountPathDepth(left);
+            var rightDepth = CountPathDepth(right);
+            return rightDepth.CompareTo(leftDepth);
+        });
+
+        foreach (var deletePath in deletePaths)
+        {
+            var fullPath = ResolveRelativePathWithinRoot(targetRoot, deletePath);
+            if (fullPath is null)
+            {
+                logger.Warn($"Patch delete path rejected due to invalid relative path: {deletePath}");
+                throw new InvalidDataException($"Patch delete path escapes runtime directory: {deletePath}");
+            }
+
+            if (File.Exists(fullPath))
+            {
+                File.Delete(fullPath);
+                removedPaths++;
+                continue;
+            }
+
+            if (Directory.Exists(fullPath))
+            {
+                Directory.Delete(fullPath, recursive: true);
+                removedPaths++;
             }
         }
 
-        progress.SetStatus("Extracting update...");
-        var installed = InstallFromZip(download, manifest.Version, installDir, runtimeDir, stageDir, manifest.EntryExe, cleanupZip: true, logger, progress);
-        progress.CloseWindow();
-        return installed;
+        return removedPaths;
+    }
+
+    private static int CountPathDepth(string relativePath)
+    {
+        var depth = 0;
+        foreach (var character in relativePath)
+        {
+            if (character == '/' || character == '\\')
+            {
+                depth++;
+            }
+        }
+
+        return depth;
+    }
+
+    private static string? ResolveRelativePathWithinRoot(string rootPath, string relativePath)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath) || Path.IsPathRooted(relativePath))
+        {
+            return null;
+        }
+
+        var fullPath = Path.GetFullPath(Path.Combine(rootPath, relativePath));
+        return IsPathWithinRoot(rootPath, fullPath) ? fullPath : null;
     }
 
     private static (string version, string path)? FindBaselineZip(string installDir)
@@ -275,12 +642,34 @@ static class Program
             var sha = root.TryGetProperty("sha256", out var s) ? s.GetString() : null;
             var entry = root.TryGetProperty("entry_exe", out var e) ? e.GetString() : null;
             var downloadSignature = root.TryGetProperty("signature_url", out var sigUrl) ? sigUrl.GetString() : null;
+            PatchArtifact? patch = null;
+            var patchFromVersion = root.TryGetProperty("patch_from_version", out var patchFromElement) ? patchFromElement.GetString() : null;
+            var patchUrl = root.TryGetProperty("patch_url", out var patchUrlElement) ? patchUrlElement.GetString() : null;
+            if (!string.IsNullOrWhiteSpace(patchFromVersion) || !string.IsNullOrWhiteSpace(patchUrl))
+            {
+                if (string.IsNullOrWhiteSpace(patchFromVersion) || string.IsNullOrWhiteSpace(patchUrl))
+                {
+                    logger.Warn("Manifest patch fields are incomplete; ignoring patch artifact.");
+                }
+                else
+                {
+                    var patchSha = root.TryGetProperty("patch_sha256", out var patchShaElement) ? patchShaElement.GetString() : null;
+                    var patchSignatureUrl = root.TryGetProperty("patch_signature_url", out var patchSignatureElement) ? patchSignatureElement.GetString() : null;
+                    patch = new PatchArtifact(
+                        patchFromVersion!,
+                        patchUrl!,
+                        string.IsNullOrWhiteSpace(patchSha) ? null : patchSha,
+                        string.IsNullOrWhiteSpace(patchSignatureUrl) ? BuildSignatureUrl(patchUrl!) : patchSignatureUrl!);
+                }
+            }
+
             return new UpdateManifest(
                 version,
                 download!,
                 string.IsNullOrWhiteSpace(sha) ? null : sha,
                 string.IsNullOrWhiteSpace(entry) ? DefaultEntryExe : entry!,
-                string.IsNullOrWhiteSpace(downloadSignature) ? BuildSignatureUrl(download!) : downloadSignature!
+                string.IsNullOrWhiteSpace(downloadSignature) ? BuildSignatureUrl(download!) : downloadSignature!,
+                patch
             );
         }
         catch (Exception ex)
@@ -1496,5 +1885,8 @@ static class Program
     private sealed record CandidateHealthResult(bool Succeeded, string Reason, Process? Process, string MarkerPath);
     private sealed record HealthMarkerResult(HealthMarkerState State, string Reason);
     private sealed record InstalledApp(string Version, string Path);
-    private sealed record UpdateManifest(string Version, string Url, string? Sha256, string EntryExe, string SignatureUrl);
+    private sealed record UpdateArtifact(string Url, string? Sha256, string SignatureUrl);
+    private sealed record PatchArtifact(string FromVersion, string Url, string? Sha256, string SignatureUrl);
+    private sealed record PatchPackage(string FromVersion, string ToVersion, string EntryExe, string[] DeletePaths);
+    private sealed record UpdateManifest(string Version, string Url, string? Sha256, string EntryExe, string SignatureUrl, PatchArtifact? Patch);
 }

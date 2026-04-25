@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 
@@ -35,6 +36,7 @@ class MakeUpdateScriptTest(unittest.TestCase):
 
             (dist_root / "MonitorSMS.exe").write_bytes(b"exe")
             (dist_root / "_internal" / "payload.txt").write_text("payload\n", encoding="utf-8")
+            (dist_root / "old-only.txt").write_text("old\n", encoding="utf-8")
             (source_root / "pyproject.toml").write_text('version = "0.0.0"\n', encoding="utf-8")
             (source_root / "src" / "station_monitor" / "main.py").write_text("print('ok')\n", encoding="utf-8")
             key_path.write_text("dummy-private-key\n", encoding="utf-8")
@@ -73,10 +75,20 @@ class MakeUpdateScriptTest(unittest.TestCase):
             env["MONITOR_GUI_ROOT"] = str(source_root)
 
             self._run_make_update(repo_root, source_root, key_path, "0.2.10", env)
+
+            first_manifest = json.loads((packaging_root / "artifacts" / "latest.json").read_text(encoding="utf-8"))
+            self.assertNotIn("patch_from_version", first_manifest)
+            self.assertNotIn("patch_url", first_manifest)
+
+            (dist_root / "_internal" / "payload.txt").write_text("payload v2\n", encoding="utf-8")
+            (dist_root / "_internal" / "new-file.txt").write_text("added\n", encoding="utf-8")
+            (dist_root / "old-only.txt").unlink()
             self._run_make_update(repo_root, source_root, key_path, "0.2.11", env)
 
             artifacts_root = packaging_root / "artifacts"
             manifests_root = artifacts_root / "manifests"
+            patch_zip = artifacts_root / "MonitorSMS-0.2.10-to-0.2.11-patch.zip"
+            patch_zip_sig = artifacts_root / "MonitorSMS-0.2.10-to-0.2.11-patch.zip.sig"
 
             self.assertTrue((artifacts_root / "latest.json").exists())
             self.assertTrue((artifacts_root / "latest.json.sig").exists())
@@ -84,6 +96,8 @@ class MakeUpdateScriptTest(unittest.TestCase):
             self.assertTrue((manifests_root / "MonitorSMS-0.2.10.json.sig").exists())
             self.assertTrue((manifests_root / "MonitorSMS-0.2.11.json").exists())
             self.assertTrue((manifests_root / "MonitorSMS-0.2.11.json.sig").exists())
+            self.assertTrue(patch_zip.exists())
+            self.assertTrue(patch_zip_sig.exists())
 
             latest_manifest = json.loads((artifacts_root / "latest.json").read_text(encoding="utf-8"))
             archived_old_manifest = json.loads((manifests_root / "MonitorSMS-0.2.10.json").read_text(encoding="utf-8"))
@@ -92,6 +106,26 @@ class MakeUpdateScriptTest(unittest.TestCase):
             self.assertEqual(latest_manifest["version"], "0.2.11")
             self.assertEqual(archived_old_manifest["version"], "0.2.10")
             self.assertEqual(archived_new_manifest["version"], "0.2.11")
+            self.assertEqual(latest_manifest["patch_from_version"], "0.2.10")
+            self.assertEqual(
+                latest_manifest["patch_url"],
+                "https://updates.example.com/updates/MonitorSMS-0.2.10-to-0.2.11-patch.zip",
+            )
+            self.assertEqual(
+                latest_manifest["patch_signature_url"],
+                "https://updates.example.com/updates/MonitorSMS-0.2.10-to-0.2.11-patch.zip.sig",
+            )
+
+            with zipfile.ZipFile(patch_zip) as archive:
+                self.assertIn("patch.json", archive.namelist())
+                self.assertIn("_internal/new-file.txt", archive.namelist())
+                self.assertIn("_internal/payload.txt", archive.namelist())
+                patch_manifest = json.loads(archive.read("patch.json").decode("utf-8"))
+
+            self.assertEqual(patch_manifest["from_version"], "0.2.10")
+            self.assertEqual(patch_manifest["to_version"], "0.2.11")
+            self.assertEqual(patch_manifest["entry_exe"], "MonitorSMS.exe")
+            self.assertIn("old-only.txt", patch_manifest["delete_paths"])
 
     def _run_make_update(
         self,

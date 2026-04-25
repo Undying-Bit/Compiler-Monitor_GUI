@@ -128,6 +128,8 @@ def upload_update_artifacts(
     latest_sig_path: Path,
     zip_path: Path,
     zip_sig_path: Path,
+    patch_path: Path | None = None,
+    patch_sig_path: Path | None = None,
 ) -> list[str]:
     latest_key = build_object_key(prefix, "latest.json")
     latest_sig_key = build_object_key(prefix, "latest.json.sig")
@@ -164,7 +166,28 @@ def upload_update_artifacts(
         content_type="application/octet-stream",
     )
 
-    return [latest_key, latest_sig_key, zip_key, zip_sig_key]
+    uploaded = [latest_key, latest_sig_key, zip_key, zip_sig_key]
+    if patch_path is not None and patch_sig_path is not None:
+        patch_key = build_object_key(prefix, patch_path.name)
+        patch_sig_key = build_object_key(prefix, patch_sig_path.name)
+        upload_file(
+            client,
+            bucket=bucket,
+            key=patch_key,
+            path=patch_path,
+            content_type="application/zip",
+            metadata={"sha256": sha256_file(patch_path)},
+        )
+        upload_file(
+            client,
+            bucket=bucket,
+            key=patch_sig_key,
+            path=patch_sig_path,
+            content_type="application/octet-stream",
+        )
+        uploaded.extend([patch_key, patch_sig_key])
+
+    return uploaded
 
 
 def publish_update_artifacts(
@@ -176,6 +199,8 @@ def publish_update_artifacts(
     latest_sig_path: Path,
     zip_path: Path,
     zip_sig_path: Path,
+    patch_path: Path | None = None,
+    patch_sig_path: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     deleted = prune_update_artifacts(client, bucket=bucket, prefix=prefix)
     uploaded = upload_update_artifacts(
@@ -186,6 +211,8 @@ def publish_update_artifacts(
         latest_sig_path=latest_sig_path,
         zip_path=zip_path,
         zip_sig_path=zip_sig_path,
+        patch_path=patch_path,
+        patch_sig_path=patch_sig_path,
     )
     return deleted, uploaded
 
@@ -205,6 +232,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--latest-sig", required=True)
     parser.add_argument("--zip", dest="zip_path", required=True)
     parser.add_argument("--zip-sig", required=True)
+    parser.add_argument("--patch", default="")
+    parser.add_argument("--patch-sig", default="")
 
     args = parser.parse_args(argv)
 
@@ -227,11 +256,18 @@ def main(argv: list[str]) -> int:
     latest_sig_path = Path(args.latest_sig).resolve()
     zip_path = Path(args.zip_path).resolve()
     zip_sig_path = Path(args.zip_sig).resolve()
+    patch_path = Path(args.patch).resolve() if args.patch else None
+    patch_sig_path = Path(args.patch_sig).resolve() if args.patch_sig else None
     try:
         ensure_file(latest_path, "latest.json")
         ensure_file(latest_sig_path, "latest.json.sig")
         ensure_file(zip_path, "ZIP file")
         ensure_file(zip_sig_path, "ZIP signature file")
+        if (patch_path is None) != (patch_sig_path is None):
+            raise FileNotFoundError("patch ZIP and patch signature file must both be provided")
+        if patch_path is not None and patch_sig_path is not None:
+            ensure_file(patch_path, "patch ZIP file")
+            ensure_file(patch_sig_path, "patch ZIP signature file")
     except FileNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -260,6 +296,8 @@ def main(argv: list[str]) -> int:
             latest_sig_path=latest_sig_path,
             zip_path=zip_path,
             zip_sig_path=zip_sig_path,
+            patch_path=patch_path,
+            patch_sig_path=patch_sig_path,
         )
     except Exception as exc:
         print(f"Error while uploading: {exc}", file=sys.stderr)

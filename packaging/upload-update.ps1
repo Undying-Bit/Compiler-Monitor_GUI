@@ -118,6 +118,58 @@ if (-not $signatureUrl.EndsWith("$zipName.sig")) {
     exit 1
 }
 
+$patchPath = $null
+$patchSigPath = $null
+$patchUrl = [string]$manifest.patch_url
+$patchFromVersion = [string]$manifest.patch_from_version
+$patchSignatureUrl = [string]$manifest.patch_signature_url
+if ($patchUrl -or $patchFromVersion -or $patchSignatureUrl) {
+    if (-not $patchUrl) {
+        Write-Error "latest.json patch fields are incomplete: patch_url is required when publishing a patch."
+        exit 1
+    }
+    if (-not $patchFromVersion) {
+        Write-Error "latest.json patch fields are incomplete: patch_from_version is required when publishing a patch."
+        exit 1
+    }
+    if (-not $patchSignatureUrl) {
+        Write-Error "latest.json patch fields are incomplete: patch_signature_url is required when publishing a patch."
+        exit 1
+    }
+
+    $patchName = "MonitorSMS-$patchFromVersion-to-$version-patch.zip"
+    $patchPath = Join-Path $ArtifactsDir $patchName
+    $patchSigPath = "$patchPath.sig"
+    if (-not (Test-Path $patchPath)) {
+        Write-Error "Expected patch ZIP not found: $patchPath"
+        exit 1
+    }
+    if (-not (Test-Path $patchSigPath)) {
+        Write-Error "Expected patch ZIP signature not found: $patchSigPath"
+        exit 1
+    }
+
+    $urlPatchName = ""
+    try {
+        $patchUri = [uri]$patchUrl
+        $urlPatchName = [System.IO.Path]::GetFileName($patchUri.AbsolutePath)
+    } catch {
+        $urlPatchName = ""
+    }
+    if (-not $urlPatchName) {
+        $urlPatchName = ($patchUrl -split "\?")[0].Split("/")[-1]
+    }
+    if ($urlPatchName -ne $patchName) {
+        Write-Error "latest.json patch_url does not end with $patchName (got $urlPatchName)."
+        exit 1
+    }
+
+    if (-not $patchSignatureUrl.EndsWith("$patchName.sig")) {
+        Write-Error "latest.json patch_signature_url does not end with $patchName.sig."
+        exit 1
+    }
+}
+
 if (-not $Endpoint) { $Endpoint = $env:UPDATE_R2_ENDPOINT }
 if (-not $Bucket) { $Bucket = $env:UPDATE_R2_BUCKET }
 if (-not $AccessKey) { $AccessKey = $env:UPDATE_R2_ACCESS_KEY }
@@ -176,6 +228,9 @@ if ($SessionToken) {
 }
 if ($Prefix) {
     $argsList += @("--prefix", $Prefix)
+}
+if ($patchPath -and $patchSigPath) {
+    $argsList += @("--patch", $patchPath, "--patch-sig", $patchSigPath)
 }
 
 & $python @argsList
