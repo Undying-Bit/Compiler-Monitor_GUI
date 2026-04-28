@@ -1,14 +1,19 @@
 param(
     [string]$OutputPath = "",
+    [string]$Channel = "",
     [string]$ManifestUrl = "",
     [string]$PrimaryBaseUrl = "",
     [string]$BackupBaseUrl = "",
     [string]$EstacionesKey = "",
     [string]$ReportesKey = "",
-    [string]$DebugPanelVisible = ""
+    [string]$DebugPanelVisible = "",
+    [string]$LocalDataSubdir = "",
+    [string]$UpdateArtifactPrefix = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "channel.ps1")
 
 function Get-ResolvedValue {
     param(
@@ -54,11 +59,16 @@ if (-not $OutputPath) {
     $OutputPath = Join-Path $compileRoot ".tmp\client-config\.env"
 }
 
+$resolvedChannel = Resolve-MonitorChannel -Channel $Channel
 $resolvedManifestUrl = Get-ResolvedValue -ExplicitValue $ManifestUrl -EnvName "MONITOR_UPDATE_MANIFEST_URL"
 $resolvedPrimaryBaseUrl = Get-ResolvedValue -ExplicitValue $PrimaryBaseUrl -EnvName "MONITOR_PRIMARY_BASE_URL"
 $resolvedBackupBaseUrl = Get-ResolvedValue -ExplicitValue $BackupBaseUrl -EnvName "MONITOR_BACKUP_BASE_URL"
 $resolvedEstacionesKey = Get-ResolvedValue -ExplicitValue $EstacionesKey -EnvName "MONITOR_KEY_ESTACIONES" -DefaultValue "estaciones.db"
 $resolvedReportesKey = Get-ResolvedValue -ExplicitValue $ReportesKey -EnvName "MONITOR_KEY_REPORTES" -DefaultValue "reportes.db"
+$defaultLocalDataSubdir = Get-ChannelLocalDataSubdir -Channel $resolvedChannel
+$resolvedLocalDataSubdir = Get-ResolvedValue -ExplicitValue $LocalDataSubdir -EnvName "MONITOR_LOCAL_DATA_SUBDIR" -DefaultValue $defaultLocalDataSubdir
+$defaultArtifactPrefix = Get-ChannelArtifactPrefix -Channel $resolvedChannel
+$resolvedUpdateArtifactPrefix = Get-ResolvedValue -ExplicitValue $UpdateArtifactPrefix -EnvName "MONITOR_UPDATE_ARTIFACT_PREFIX" -DefaultValue $defaultArtifactPrefix
 
 if ($PSBoundParameters.ContainsKey("DebugPanelVisible")) {
     $resolvedDebugPanelVisible = ConvertTo-BoolText -Value $DebugPanelVisible -Name "DebugPanelVisible"
@@ -83,6 +93,9 @@ if (-not (Test-Path $outputDir)) {
 }
 
 $lines = @(
+    "MONITOR_CHANNEL=$resolvedChannel"
+    "MONITOR_LOCAL_DATA_SUBDIR=$resolvedLocalDataSubdir"
+    "MONITOR_UPDATE_ARTIFACT_PREFIX=$resolvedUpdateArtifactPrefix"
     "MONITOR_PRIMARY_BASE_URL=$resolvedPrimaryBaseUrl"
     "MONITOR_BACKUP_BASE_URL=$resolvedBackupBaseUrl"
     "MONITOR_KEY_ESTACIONES=$resolvedEstacionesKey"

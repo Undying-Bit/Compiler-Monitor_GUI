@@ -44,6 +44,25 @@ function Get-CompilePaths {
     }
 }
 
+function Get-VersionArtifactsPath {
+    param(
+        [string]$ArtifactsRoot,
+        [string]$Version,
+        [string]$ArtifactPrefix = ""
+    )
+
+    if (-not $ArtifactsRoot) {
+        throw "Artifacts root path is required."
+    }
+
+    if (-not $Version) {
+        throw "Version is required to resolve artifacts path."
+    }
+
+    $folderName = "${ArtifactPrefix}MonitorSMS-$Version"
+    return Join-Path $ArtifactsRoot $folderName
+}
+
 if ($MyInvocation.InvocationName -ne '.') {
     Get-CompilePaths -SourceRoot $SourceRoot
 }

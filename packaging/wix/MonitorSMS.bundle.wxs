@@ -1,26 +1,34 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
-     xmlns:netcore="http://wixtoolset.org/schemas/v4/wxs/netcore">
+     xmlns:netfx="http://wixtoolset.org/schemas/v4/wxs/netfx">
+  <?ifndef ProductDisplayName?>
+    <?define ProductDisplayName = "Monitor SMS"?>
+  <?endif?>
+  <?ifndef BundleUpgradeCode?>
+    <?define BundleUpgradeCode = "{F24697B9-AECB-4296-9821-9C3D50A23A9F}"?>
+  <?endif?>
   <?ifndef EmbedNet8Runtime?>
     <?define EmbedNet8Runtime = no?>
   <?endif?>
   <Bundle
-    Name="Monitor SMS"
+    Name="$(var.ProductDisplayName)"
     Manufacturer="Internal Tools"
     Version="$(var.Version)"
-    UpgradeCode="{F24697B9-AECB-4296-9821-9C3D50A23A9F}">
+    UpgradeCode="$(var.BundleUpgradeCode)">
 
     <BootstrapperApplication>
-      <bal:WixStandardBootstrapperApplication SuppressOptionsUI="yes" />
+      <bal:WixStandardBootstrapperApplication
+        Theme="hyperlinkLicense"
+        LicenseUrl=""
+        SuppressOptionsUI="yes" />
     </BootstrapperApplication>
 
-    <netcore:DotNetCoreSearch
+    <netfx:DotNetCoreSearch
       Id="Net8DesktopRuntimeSearch"
       RuntimeType="desktop"
       Platform="x64"
       MajorVersion="8"
-      MinorVersion="0"
       Variable="Net8DesktopRuntimeInstalled" />
 
     <Chain>
@@ -30,9 +38,9 @@
         PerMachine="yes"
         Permanent="yes"
         Vital="yes"
-        Cache="yes"
+        Cache="keep"
         Compressed="yes"
-        InstallCommand="/install /quiet /norestart"
+        InstallArguments="/install /quiet /norestart"
         DetectCondition="Net8DesktopRuntimeInstalled"
         InstallCondition="NOT Net8DesktopRuntimeInstalled"
         SourceFile="$(var.Net8RuntimeFile)" />
@@ -42,9 +50,9 @@
         PerMachine="yes"
         Permanent="yes"
         Vital="yes"
-        Cache="no"
+        Cache="remove"
         Compressed="no"
-        InstallCommand="/install /quiet /norestart"
+        InstallArguments="/install /quiet /norestart"
         DetectCondition="Net8DesktopRuntimeInstalled"
         InstallCondition="NOT Net8DesktopRuntimeInstalled"
         DownloadUrl="$(var.Net8RuntimeUrl)"

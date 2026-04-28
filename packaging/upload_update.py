@@ -7,7 +7,11 @@ import sys
 from pathlib import Path
 
 UPDATE_MANIFEST_NAMES = {"latest.json", "latest.json.sig"}
-UPDATE_ARCHIVE_RE = re.compile(r"^MonitorSMS-[^/]+\.zip(?:\.sig)?$", re.IGNORECASE)
+
+
+def build_update_archive_re(artifact_prefix: str) -> re.Pattern[str]:
+    escaped_prefix = re.escape(artifact_prefix)
+    return re.compile(rf"^{escaped_prefix}MonitorSMS-[^/]+\.zip(?:\.sig)?$", re.IGNORECASE)
 
 
 def parse_bool(value: str, *, default: bool) -> bool:
@@ -40,10 +44,12 @@ def relative_key_for_prefix(key: str, prefix: str) -> str | None:
     return key
 
 
-def is_update_artifact_relative_key(relative_key: str) -> bool:
+def is_update_artifact_relative_key(relative_key: str, *, artifact_prefix: str) -> bool:
     if not relative_key or "/" in relative_key:
         return False
-    return relative_key in UPDATE_MANIFEST_NAMES or bool(UPDATE_ARCHIVE_RE.fullmatch(relative_key))
+    if relative_key in UPDATE_MANIFEST_NAMES:
+        return True
+    return bool(build_update_archive_re(artifact_prefix).fullmatch(relative_key))
 
 
 def ensure_file(path: Path, label: str) -> None:
@@ -76,7 +82,16 @@ def upload_file(
     client.upload_file(str(path), bucket, key, ExtraArgs=extra_args)
 
 
-def list_update_artifact_keys(client, *, bucket: str, prefix: str) -> list[str]:
+def list_update_artifact_keys(client, *, bucket: str, prefix: str, artifact_prefix: str) -> list[str]:
+    archive_re = build_update_archive_re(artifact_prefix)
+
+    def is_update_key(relative_key: str) -> bool:
+        if not relative_key or "/" in relative_key:
+            return False
+        if relative_key in UPDATE_MANIFEST_NAMES:
+            return True
+        return bool(archive_re.fullmatch(relative_key))
+
     paginator = client.get_paginator("list_objects_v2")
     paginate_kwargs = {"Bucket": bucket}
     if prefix:
@@ -89,7 +104,7 @@ def list_update_artifact_keys(client, *, bucket: str, prefix: str) -> list[str]:
             if not key:
                 continue
             relative_key = relative_key_for_prefix(key, prefix)
-            if relative_key and is_update_artifact_relative_key(relative_key):
+            if relative_key and is_update_key(relative_key):
                 keys.append(key)
     return keys
 
@@ -113,8 +128,8 @@ def delete_keys(client, *, bucket: str, keys: list[str]) -> None:
             raise RuntimeError(f"Delete failed for one or more objects: {rendered}")
 
 
-def prune_update_artifacts(client, *, bucket: str, prefix: str) -> list[str]:
-    keys = list_update_artifact_keys(client, bucket=bucket, prefix=prefix)
+def prune_update_artifacts(client, *, bucket: str, prefix: str, artifact_prefix: str) -> list[str]:
+    keys = list_update_artifact_keys(client, bucket=bucket, prefix=prefix, artifact_prefix=artifact_prefix)
     delete_keys(client, bucket=bucket, keys=keys)
     return keys
 
@@ -128,8 +143,8 @@ def upload_update_artifacts(
     latest_sig_path: Path,
     zip_path: Path,
     zip_sig_path: Path,
-    patch_path: Path | None = None,
-    patch_sig_path: Path | None = None,
+    app_path: Path | None = None,
+    app_sig_path: Path | None = None,
 ) -> list[str]:
     latest_key = build_object_key(prefix, "latest.json")
     latest_sig_key = build_object_key(prefix, "latest.json.sig")
@@ -167,25 +182,25 @@ def upload_update_artifacts(
     )
 
     uploaded = [latest_key, latest_sig_key, zip_key, zip_sig_key]
-    if patch_path is not None and patch_sig_path is not None:
-        patch_key = build_object_key(prefix, patch_path.name)
-        patch_sig_key = build_object_key(prefix, patch_sig_path.name)
+    if app_path is not None and app_sig_path is not None:
+        app_key = build_object_key(prefix, app_path.name)
+        app_sig_key = build_object_key(prefix, app_sig_path.name)
         upload_file(
             client,
             bucket=bucket,
-            key=patch_key,
-            path=patch_path,
+            key=app_key,
+            path=app_path,
             content_type="application/zip",
-            metadata={"sha256": sha256_file(patch_path)},
+            metadata={"sha256": sha256_file(app_path)},
         )
         upload_file(
             client,
             bucket=bucket,
-            key=patch_sig_key,
-            path=patch_sig_path,
+            key=app_sig_key,
+            path=app_sig_path,
             content_type="application/octet-stream",
         )
-        uploaded.extend([patch_key, patch_sig_key])
+        uploaded.extend([app_key, app_sig_key])
 
     return uploaded
 
@@ -199,10 +214,11 @@ def publish_update_artifacts(
     latest_sig_path: Path,
     zip_path: Path,
     zip_sig_path: Path,
-    patch_path: Path | None = None,
-    patch_sig_path: Path | None = None,
+    artifact_prefix: str = "",
+    app_path: Path | None = None,
+    app_sig_path: Path | None = None,
 ) -> tuple[list[str], list[str]]:
-    deleted = prune_update_artifacts(client, bucket=bucket, prefix=prefix)
+    deleted = prune_update_artifacts(client, bucket=bucket, prefix=prefix, artifact_prefix=artifact_prefix)
     uploaded = upload_update_artifacts(
         client,
         bucket=bucket,
@@ -211,8 +227,8 @@ def publish_update_artifacts(
         latest_sig_path=latest_sig_path,
         zip_path=zip_path,
         zip_sig_path=zip_sig_path,
-        patch_path=patch_path,
-        patch_sig_path=patch_sig_path,
+        app_path=app_path,
+        app_sig_path=app_sig_path,
     )
     return deleted, uploaded
 
@@ -228,12 +244,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--use-ssl", default="true")
     parser.add_argument("--verify-tls", default="true")
     parser.add_argument("--prefix", default="")
+    parser.add_argument("--artifact-prefix", default="")
     parser.add_argument("--latest", required=True)
     parser.add_argument("--latest-sig", required=True)
     parser.add_argument("--zip", dest="zip_path", required=True)
     parser.add_argument("--zip-sig", required=True)
-    parser.add_argument("--patch", default="")
-    parser.add_argument("--patch-sig", default="")
+    parser.add_argument("--app", default="")
+    parser.add_argument("--app-sig", default="")
 
     args = parser.parse_args(argv)
 
@@ -256,18 +273,18 @@ def main(argv: list[str]) -> int:
     latest_sig_path = Path(args.latest_sig).resolve()
     zip_path = Path(args.zip_path).resolve()
     zip_sig_path = Path(args.zip_sig).resolve()
-    patch_path = Path(args.patch).resolve() if args.patch else None
-    patch_sig_path = Path(args.patch_sig).resolve() if args.patch_sig else None
+    app_path = Path(args.app).resolve() if args.app else None
+    app_sig_path = Path(args.app_sig).resolve() if args.app_sig else None
     try:
         ensure_file(latest_path, "latest.json")
         ensure_file(latest_sig_path, "latest.json.sig")
         ensure_file(zip_path, "ZIP file")
         ensure_file(zip_sig_path, "ZIP signature file")
-        if (patch_path is None) != (patch_sig_path is None):
-            raise FileNotFoundError("patch ZIP and patch signature file must both be provided")
-        if patch_path is not None and patch_sig_path is not None:
-            ensure_file(patch_path, "patch ZIP file")
-            ensure_file(patch_sig_path, "patch ZIP signature file")
+        if (app_path is None) != (app_sig_path is None):
+            raise FileNotFoundError("app-only ZIP and app-only signature file must both be provided")
+        if app_path is not None and app_sig_path is not None:
+            ensure_file(app_path, "app-only ZIP file")
+            ensure_file(app_sig_path, "app-only ZIP signature file")
     except FileNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -286,6 +303,7 @@ def main(argv: list[str]) -> int:
     )
 
     prefix = normalize_prefix(args.prefix or "")
+    artifact_prefix = args.artifact_prefix or ""
 
     try:
         deleted_keys, uploaded_keys = publish_update_artifacts(
@@ -296,8 +314,9 @@ def main(argv: list[str]) -> int:
             latest_sig_path=latest_sig_path,
             zip_path=zip_path,
             zip_sig_path=zip_sig_path,
-            patch_path=patch_path,
-            patch_sig_path=patch_sig_path,
+            artifact_prefix=artifact_prefix,
+            app_path=app_path,
+            app_sig_path=app_sig_path,
         )
     except Exception as exc:
         print(f"Error while uploading: {exc}", file=sys.stderr)

@@ -8,6 +8,8 @@ This Worker brokers signed update artifacts and database downloads from R2 witho
 - `/updates/latest.json.sig`
 - `/updates/MonitorSMS-<version>.zip`
 - `/updates/MonitorSMS-<version>.zip.sig`
+- `/estaciones.db`
+- `/reportes.db`
 - `/data/estaciones.db`
 - `/data/reportes.db`
 
@@ -19,9 +21,20 @@ This Worker brokers signed update artifacts and database downloads from R2 witho
 - `DATA_PREFIX`
 - optional `UPDATE_TOKEN`
 
-R2 binding:
+R2 bindings:
 
 - `UPDATES_BUCKET`
+- `DATA_BUCKET`
+
+Default release bucket mapping:
+
+- `UPDATES_BUCKET=monitor-updates`
+- `DATA_BUCKET=reportes-db`
+
+Development environment bucket mapping:
+
+- `UPDATES_BUCKET=development-updates`
+- `DATA_BUCKET=development-db`
 
 If `UPDATE_TOKEN` is set, requests must include:
 

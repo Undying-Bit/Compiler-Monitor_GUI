@@ -9,13 +9,18 @@ param(
     [Nullable[bool]]$VerifyTls,
     [string]$Prefix = "",
     [string]$ArtifactsDir = "",
-    [string]$SourceRoot = ""
+    [string]$SourceRoot = "",
+    [string]$Channel = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "paths.ps1")
+. (Join-Path $PSScriptRoot "channel.ps1")
 $paths = Get-CompilePaths -SourceRoot $SourceRoot
+$resolvedChannel = Resolve-MonitorChannel -Channel $Channel
+$artifactPrefix = Get-ChannelArtifactPrefix -Channel $resolvedChannel
+$artifactNamePrefix = Get-ChannelArtifactNamePrefix -Channel $resolvedChannel
 
 function Get-EnvBool {
     param(
@@ -43,7 +48,13 @@ function Require-Value {
 }
 
 if (-not $ArtifactsDir) {
-    $ArtifactsDir = $paths.ArtifactsPath
+    $versionLine = Select-String -Path (Join-Path $paths.SourceRoot "pyproject.toml") -Pattern '^version\s*=' | Select-Object -First 1
+    if (-not $versionLine) {
+        Write-Error "Unable to find version in pyproject.toml."
+        exit 1
+    }
+    $version = ($versionLine.Line -replace 'version\s*=\s*"(.*)"', '$1').Trim()
+    $ArtifactsDir = Get-VersionArtifactsPath -ArtifactsRoot $paths.ArtifactsPath -Version $version -ArtifactPrefix $artifactPrefix
 }
 if (-not (Test-Path $ArtifactsDir)) {
     Write-Error "Artifacts directory not found: $ArtifactsDir"
@@ -74,7 +85,7 @@ if (-not $version) {
     exit 1
 }
 
-$zipName = "MonitorSMS-$version.zip"
+$zipName = "$artifactNamePrefix$version.zip"
 $zipPath = Join-Path $ArtifactsDir $zipName
 $zipSigPath = "$zipPath.sig"
 if (-not (Test-Path $zipPath)) {
@@ -118,54 +129,54 @@ if (-not $signatureUrl.EndsWith("$zipName.sig")) {
     exit 1
 }
 
-$patchPath = $null
-$patchSigPath = $null
-$patchUrl = [string]$manifest.patch_url
-$patchFromVersion = [string]$manifest.patch_from_version
-$patchSignatureUrl = [string]$manifest.patch_signature_url
-if ($patchUrl -or $patchFromVersion -or $patchSignatureUrl) {
-    if (-not $patchUrl) {
-        Write-Error "latest.json patch fields are incomplete: patch_url is required when publishing a patch."
+$appPath = $null
+$appSigPath = $null
+$runtimeId = [string]$manifest.runtime_id
+$appUrl = [string]$manifest.app_url
+$appSignatureUrl = [string]$manifest.app_signature_url
+if ($runtimeId -or $appUrl -or $appSignatureUrl) {
+    if (-not $runtimeId) {
+        Write-Error "latest.json app-only fields are incomplete: runtime_id is required when publishing an app-only ZIP."
         exit 1
     }
-    if (-not $patchFromVersion) {
-        Write-Error "latest.json patch fields are incomplete: patch_from_version is required when publishing a patch."
+    if (-not $appUrl) {
+        Write-Error "latest.json app-only fields are incomplete: app_url is required when publishing an app-only ZIP."
         exit 1
     }
-    if (-not $patchSignatureUrl) {
-        Write-Error "latest.json patch fields are incomplete: patch_signature_url is required when publishing a patch."
-        exit 1
-    }
-
-    $patchName = "MonitorSMS-$patchFromVersion-to-$version-patch.zip"
-    $patchPath = Join-Path $ArtifactsDir $patchName
-    $patchSigPath = "$patchPath.sig"
-    if (-not (Test-Path $patchPath)) {
-        Write-Error "Expected patch ZIP not found: $patchPath"
-        exit 1
-    }
-    if (-not (Test-Path $patchSigPath)) {
-        Write-Error "Expected patch ZIP signature not found: $patchSigPath"
+    if (-not $appSignatureUrl) {
+        Write-Error "latest.json app-only fields are incomplete: app_signature_url is required when publishing an app-only ZIP."
         exit 1
     }
 
-    $urlPatchName = ""
+    $appName = "$artifactNamePrefix$version-app.zip"
+    $appPath = Join-Path $ArtifactsDir $appName
+    $appSigPath = "$appPath.sig"
+    if (-not (Test-Path $appPath)) {
+        Write-Error "Expected app-only ZIP not found: $appPath"
+        exit 1
+    }
+    if (-not (Test-Path $appSigPath)) {
+        Write-Error "Expected app-only ZIP signature not found: $appSigPath"
+        exit 1
+    }
+
+    $urlAppName = ""
     try {
-        $patchUri = [uri]$patchUrl
-        $urlPatchName = [System.IO.Path]::GetFileName($patchUri.AbsolutePath)
+        $appUri = [uri]$appUrl
+        $urlAppName = [System.IO.Path]::GetFileName($appUri.AbsolutePath)
     } catch {
-        $urlPatchName = ""
+        $urlAppName = ""
     }
-    if (-not $urlPatchName) {
-        $urlPatchName = ($patchUrl -split "\?")[0].Split("/")[-1]
+    if (-not $urlAppName) {
+        $urlAppName = ($appUrl -split "\?")[0].Split("/")[-1]
     }
-    if ($urlPatchName -ne $patchName) {
-        Write-Error "latest.json patch_url does not end with $patchName (got $urlPatchName)."
+    if ($urlAppName -ne $appName) {
+        Write-Error "latest.json app_url does not end with $appName (got $urlAppName)."
         exit 1
     }
 
-    if (-not $patchSignatureUrl.EndsWith("$patchName.sig")) {
-        Write-Error "latest.json patch_signature_url does not end with $patchName.sig."
+    if (-not $appSignatureUrl.EndsWith("$appName.sig")) {
+        Write-Error "latest.json app_signature_url does not end with $appName.sig."
         exit 1
     }
 }
@@ -177,6 +188,7 @@ if (-not $SecretKey) { $SecretKey = $env:UPDATE_R2_SECRET_KEY }
 if (-not $Region) { $Region = $env:UPDATE_R2_REGION }
 if (-not $SessionToken) { $SessionToken = $env:UPDATE_R2_SESSION_TOKEN }
 if (-not $Prefix) { $Prefix = $env:UPDATE_R2_PREFIX }
+if (-not $Bucket) { $Bucket = Get-ChannelUpdateBucket -Channel $resolvedChannel }
 
 if ($PSBoundParameters.ContainsKey("UseSsl")) {
     $useSslValue = [bool]$UseSsl
@@ -194,6 +206,8 @@ Require-Value -Value $Endpoint -EnvName "UPDATE_R2_ENDPOINT" -ParamName "Endpoin
 Require-Value -Value $Bucket -EnvName "UPDATE_R2_BUCKET" -ParamName "Bucket"
 Require-Value -Value $AccessKey -EnvName "UPDATE_R2_ACCESS_KEY" -ParamName "AccessKey"
 Require-Value -Value $SecretKey -EnvName "UPDATE_R2_SECRET_KEY" -ParamName "SecretKey"
+
+Write-Host "Using channel '$resolvedChannel' with artifact prefix '$artifactPrefix' and bucket '$Bucket'"
 
 $python = Join-Path $paths.SourceRoot ".venv\\Scripts\\python.exe"
 if (-not (Test-Path $python)) {
@@ -229,8 +243,11 @@ if ($SessionToken) {
 if ($Prefix) {
     $argsList += @("--prefix", $Prefix)
 }
-if ($patchPath -and $patchSigPath) {
-    $argsList += @("--patch", $patchPath, "--patch-sig", $patchSigPath)
+if ($artifactPrefix) {
+    $argsList += @("--artifact-prefix", $artifactPrefix)
+}
+if ($appPath -and $appSigPath) {
+    $argsList += @("--app", $appPath, "--app-sig", $appSigPath)
 }
 
 & $python @argsList

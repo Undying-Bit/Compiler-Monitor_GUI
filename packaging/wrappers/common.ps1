@@ -3,7 +3,8 @@ $ErrorActionPreference = "Stop"
 function Initialize-PackagingWrapper {
   param(
     [string]$ScriptRoot,
-    [string]$LocalEnvPath = ""
+    [string]$LocalEnvPath = "",
+    [string]$Channel = ""
   )
 
   $packagingRoot = Split-Path -Parent $ScriptRoot
@@ -11,7 +12,7 @@ function Initialize-PackagingWrapper {
   Set-Location -Path $repoRoot
 
   if (-not $LocalEnvPath) {
-    $LocalEnvPath = Join-Path $packagingRoot "local.env"
+    $LocalEnvPath = Resolve-DefaultLocalEnvPath -PackagingRoot $packagingRoot -Channel $Channel
   }
 
   Import-LocalEnv -Path $LocalEnvPath
@@ -21,6 +22,34 @@ function Initialize-PackagingWrapper {
     RepoRoot = $repoRoot
     LocalEnvPath = $LocalEnvPath
   }
+}
+
+function Resolve-DefaultLocalEnvPath {
+  param(
+    [string]$PackagingRoot,
+    [string]$Channel = ""
+  )
+
+  $resolvedChannel = $Channel
+  if ([string]::IsNullOrWhiteSpace($resolvedChannel)) {
+    $resolvedChannel = [Environment]::GetEnvironmentVariable("MONITOR_RELEASE_CHANNEL", "Process")
+  }
+  $resolvedChannel = if ($resolvedChannel) { $resolvedChannel.Trim().ToLowerInvariant() } else { "" }
+
+  $candidateName = switch ($resolvedChannel) {
+    "development" { "local.development.env" }
+    "release" { "local.release.env" }
+    default { "" }
+  }
+
+  if ($candidateName) {
+    $candidatePath = Join-Path $PackagingRoot $candidateName
+    if (Test-Path -LiteralPath $candidatePath) {
+      return $candidatePath
+    }
+  }
+
+  return Join-Path $PackagingRoot "local.env"
 }
 
 function Import-LocalEnv {
@@ -102,7 +131,7 @@ function Assert-RequiredEnv {
 
   if ($missing.Count -gt 0) {
     $joined = $missing -join ", "
-    throw "Missing required configuration: $joined. Set these in the process environment or packaging\local.env."
+    throw "Missing required configuration: $joined. Set these in the process environment or packaging\local.env (or channel-specific packaging\local.release.env / packaging\local.development.env)."
   }
 }
 

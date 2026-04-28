@@ -62,6 +62,9 @@ class ClientConfigGenerationTest(unittest.TestCase):
         self._run_config(output_path, env=env)
 
         rendered = output_path.read_text(encoding="utf-8")
+        self.assertIn("MONITOR_CHANNEL=release", rendered)
+        self.assertIn("MONITOR_LOCAL_DATA_SUBDIR=MonitorSMS", rendered)
+        self.assertIn("MONITOR_UPDATE_ARTIFACT_PREFIX=", rendered)
         self.assertIn("MONITOR_PRIMARY_BASE_URL=https://updates.example.com/data", rendered)
         self.assertIn("MONITOR_UPDATE_MANIFEST_URL=https://updates.example.com/updates/latest.json", rendered)
         self.assertNotIn("MONITOR_R2_ACCESS_KEY", rendered)
@@ -89,6 +92,19 @@ class ClientConfigGenerationTest(unittest.TestCase):
 
                 rendered = output_path.read_text(encoding="utf-8")
                 self.assertIn(f"MONITOR_DEBUG_PANEL_VISIBLE={expected}", rendered)
+
+    def test_channel_development_sets_local_data_subdir_and_prefix(self) -> None:
+        scratch_root = ROOT / ".tmp" / "test-client-config"
+        output_dir = scratch_root / uuid.uuid4().hex
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(output_dir, ignore_errors=True))
+
+        output_path = output_dir / "development.env"
+        self._run_config(output_path, "-Channel", "development")
+        rendered = output_path.read_text(encoding="utf-8")
+        self.assertIn("MONITOR_CHANNEL=development", rendered)
+        self.assertIn("MONITOR_LOCAL_DATA_SUBDIR=MonitorSMS-Development", rendered)
+        self.assertIn("MONITOR_UPDATE_ARTIFACT_PREFIX=development_", rendered)
 
 
 if __name__ == "__main__":

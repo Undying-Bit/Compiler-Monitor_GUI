@@ -1,6 +1,7 @@
 param(
   [string]$SourceRoot = "",
-  [string]$LocalEnvPath = ""
+  [string]$LocalEnvPath = "",
+  [string]$Channel = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,7 +10,10 @@ $ErrorActionPreference = "Stop"
 
 $success = $false
 try {
-  $context = Initialize-PackagingWrapper -ScriptRoot $PSScriptRoot -LocalEnvPath $LocalEnvPath
+  if ($Channel) {
+    [Environment]::SetEnvironmentVariable("MONITOR_RELEASE_CHANNEL", $Channel, "Process")
+  }
+  $context = Initialize-PackagingWrapper -ScriptRoot $PSScriptRoot -LocalEnvPath $LocalEnvPath -Channel $Channel
   Assert-RequiredEnv -Names @("MONITOR_UPDATE_SIGNING_PUBLIC_KEY_PATH")
 
   $sourceArgs = New-SourceArgs -SourceRoot $SourceRoot

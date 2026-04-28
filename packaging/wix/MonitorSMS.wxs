@@ -1,11 +1,29 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <?ifndef ProductDisplayName?>
+    <?define ProductDisplayName = "Monitor SMS"?>
+  <?endif?>
+  <?ifndef InstallFolderName?>
+    <?define InstallFolderName = "MonitorSMS"?>
+  <?endif?>
+  <?ifndef ProgramMenuFolderName?>
+    <?define ProgramMenuFolderName = "Monitor SMS"?>
+  <?endif?>
+  <?ifndef DesktopShortcutName?>
+    <?define DesktopShortcutName = "$(var.ProductDisplayName)"?>
+  <?endif?>
+  <?ifndef RuntimeDataSubdir?>
+    <?define RuntimeDataSubdir = "MonitorSMS"?>
+  <?endif?>
+  <?ifndef MsiUpgradeCode?>
+    <?define MsiUpgradeCode = "{7F2FCA2E-0E1A-4E65-90C1-7D8C5B7A01C2}"?>
+  <?endif?>
   <Package
-    Name="Monitor SMS"
+    Name="$(var.ProductDisplayName)"
     Manufacturer="Internal Tools"
     Version="$(var.Version)"
-    UpgradeCode="{7F2FCA2E-0E1A-4E65-90C1-7D8C5B7A01C2}"
+    UpgradeCode="$(var.MsiUpgradeCode)"
     Scope="perUser"
   >
     <?ifdef ArpIcon?>
@@ -13,29 +31,29 @@
       <Property Id="ARPPRODUCTICON" Value="AppIcon" />
     <?endif?>
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Monitor SMS is already installed." />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of $(var.ProductDisplayName) is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <CustomAction
       Id="SetRuntimeDir"
       Property="MONITORSMSRUNTIMEDIR"
-      Value="[LocalAppDataFolder]MonitorSMS\\runtime" />
+      Value="[LocalAppDataFolder]$(var.RuntimeDataSubdir)\\runtime" />
 
     <StandardDirectory Id="LocalAppDataFolder">
         <Directory Id="INSTALLROOT" Name="Programs">
-        <Directory Id="INSTALLFOLDER" Name="MonitorSMS">
+        <Directory Id="INSTALLFOLDER" Name="$(var.InstallFolderName)">
           <Component Id="LauncherComponent" Guid="*">
             <File Id="LauncherExe" Source="$(var.LauncherExe)" KeyPath="yes">
               <Shortcut
                 Id="StartMenuShortcut"
                 Directory="ProgramMenuDir"
-                Name="Monitor SMS"
+                Name="$(var.ProgramMenuFolderName)"
                 WorkingDirectory="INSTALLFOLDER"
                 Advertise="no"
               />
               <Shortcut
                 Id="DesktopShortcut"
                 Directory="DesktopFolder"
-                Name="Monitor SMS"
+                Name="$(var.DesktopShortcutName)"
                 WorkingDirectory="INSTALLFOLDER"
                 Advertise="no"
               />
@@ -49,7 +67,7 @@
 
         </Directory>
       </Directory>
-      <Directory Id="MonitorSMSDataDir" Name="MonitorSMS">
+      <Directory Id="MonitorSMSDataDir" Name="$(var.RuntimeDataSubdir)">
         <Directory Id="MonitorSMSRuntimeDir" Name="runtime">
           <Component Id="RuntimeCleanupComponent" Guid="{665222B9-85DD-4C17-B2AB-C0DA7F3634C5}">
             <CreateFolder />
@@ -60,12 +78,12 @@
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="ProgramMenuDir" Name="Monitor SMS" />
+      <Directory Id="ProgramMenuDir" Name="$(var.ProgramMenuFolderName)" />
     </StandardDirectory>
 
     <StandardDirectory Id="DesktopFolder" />
 
-    <Feature Id="MainFeature" Title="Monitor SMS" Level="1">
+    <Feature Id="MainFeature" Title="$(var.ProductDisplayName)" Level="1">
       <ComponentRef Id="LauncherComponent" />
       <ComponentRef Id="EnvComponent" />
       <ComponentRef Id="RuntimeCleanupComponent" />

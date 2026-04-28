@@ -3,6 +3,7 @@
     [string]$LauncherExe = "",
     [string]$Output = "",
     [string]$SourceRoot = "",
+    [string]$Channel = "",
     [string]$ManifestUrl = "",
     [string]$PrimaryBaseUrl = "",
     [string]$BackupBaseUrl = "",
@@ -15,7 +16,16 @@
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "paths.ps1")
+. (Join-Path $PSScriptRoot "channel.ps1")
 $paths = Get-CompilePaths -SourceRoot $SourceRoot
+$resolvedChannel = Resolve-MonitorChannel -Channel $Channel
+$artifactPrefix = Get-ChannelArtifactPrefix -Channel $resolvedChannel
+$productDisplayName = Get-ChannelProductDisplayName -Channel $resolvedChannel
+$installFolderName = Get-ChannelInstallFolderName -Channel $resolvedChannel
+$programMenuFolderName = Get-ChannelProgramMenuFolderName -Channel $resolvedChannel
+$desktopShortcutName = Get-ChannelDesktopShortcutName -Channel $resolvedChannel
+$localDataSubdir = Get-ChannelLocalDataSubdir -Channel $resolvedChannel
+$msiUpgradeCode = Get-ChannelMsiUpgradeCode -Channel $resolvedChannel
 
 $root = $paths.SourceRoot
 $wxs = Join-Path $PSScriptRoot "wix\MonitorSMS.wxs"
@@ -117,11 +127,19 @@ To override this check, pass -AllowSelfContained.
 }
 
 if (-not $Output) {
-    $Output = Join-Path $paths.ArtifactsPath "MonitorSMS-$Version.msi"
+    $versionArtifactsDir = Get-VersionArtifactsPath -ArtifactsRoot $paths.ArtifactsPath -Version $Version -ArtifactPrefix $artifactPrefix
+    New-Item -ItemType Directory -Path $versionArtifactsDir -Force | Out-Null
+    $Output = Join-Path $versionArtifactsDir ("${artifactPrefix}MonitorSMS-$Version.msi")
+}
+
+$outputDir = Split-Path -Parent $Output
+if ($outputDir -and -not (Test-Path $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 }
 
 $clientConfigArgs = @{
     OutputPath = $clientConfigFile
+    Channel = $resolvedChannel
     ManifestUrl = $ManifestUrl
     PrimaryBaseUrl = $PrimaryBaseUrl
     BackupBaseUrl = $BackupBaseUrl
@@ -143,6 +161,12 @@ $args = @(
     $wxs,
     "-ext", "WixToolset.Util.wixext",
     "-d", "Version=$Version",
+    "-d", "ProductDisplayName=$productDisplayName",
+    "-d", "InstallFolderName=$installFolderName",
+    "-d", "ProgramMenuFolderName=$programMenuFolderName",
+    "-d", "DesktopShortcutName=$desktopShortcutName",
+    "-d", "RuntimeDataSubdir=$localDataSubdir",
+    "-d", "MsiUpgradeCode=$msiUpgradeCode",
     "-d", "LauncherExe=$LauncherExe",
     "-d", "EnvFile=$clientConfigFile",
     "-o", $Output

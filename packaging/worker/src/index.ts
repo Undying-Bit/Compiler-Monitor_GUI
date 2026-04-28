@@ -1,9 +1,12 @@
 export interface Env {
   UPDATES_BUCKET: R2Bucket;
+  DATA_BUCKET: R2Bucket;
   UPDATES_PREFIX?: string;
   DATA_PREFIX?: string;
   UPDATE_TOKEN?: string;
 }
+
+type BucketRoute = "updates" | "data";
 
 function normalizePrefix(prefix: string): string {
   return prefix.replace(/^\/+|\/+$/g, "");
@@ -37,7 +40,7 @@ function contentTypeForPath(path: string): string | null {
   return null;
 }
 
-function resolveObjectKey(pathname: string, env: Env): string | null {
+function resolveObjectTarget(pathname: string, env: Env): { route: BucketRoute; objectKey: string } | null {
   const trimmed = pathname.replace(/^\/+|\/+$/g, "");
   if (!trimmed) {
     return null;
@@ -49,16 +52,35 @@ function resolveObjectKey(pathname: string, env: Env): string | null {
 
   if (route === "updates" && remainder) {
     const prefix = normalizePrefix(env.UPDATES_PREFIX || "");
-    return prefix ? `${prefix}/${remainder}` : remainder;
+    return {
+      route: "updates",
+      objectKey: prefix ? `${prefix}/${remainder}` : remainder,
+    };
   }
 
   if (route === "data" && remainder) {
     const prefix = normalizePrefix(env.DATA_PREFIX || "");
-    return prefix ? `${prefix}/${remainder}` : remainder;
+    return {
+      route: "data",
+      objectKey: prefix ? `${prefix}/${remainder}` : remainder,
+    };
+  }
+
+  // Support root DB paths for clients that use /estaciones.db or /reportes.db.
+  const rootDataObject = trimmed.toLowerCase();
+  if (rootDataObject === "estaciones.db" || rootDataObject === "reportes.db") {
+    const prefix = normalizePrefix(env.DATA_PREFIX || "");
+    return {
+      route: "data",
+      objectKey: prefix ? `${prefix}/${trimmed}` : trimmed,
+    };
   }
 
   const legacyPrefix = normalizePrefix(env.UPDATES_PREFIX || "");
-  return legacyPrefix ? `${legacyPrefix}/${trimmed}` : trimmed;
+  return {
+    route: "updates",
+    objectKey: legacyPrefix ? `${legacyPrefix}/${trimmed}` : trimmed,
+  };
 }
 
 export default {
@@ -72,24 +94,25 @@ export default {
     }
 
     const url = new URL(request.url);
-    const objectKey = resolveObjectKey(url.pathname, env);
-    if (!objectKey) {
+    const target = resolveObjectTarget(url.pathname, env);
+    if (!target) {
       return new Response("Not Found", { status: 404 });
     }
 
-    const object = await env.UPDATES_BUCKET.get(objectKey);
+    const bucket = target.route === "data" ? env.DATA_BUCKET : env.UPDATES_BUCKET;
+    const object = await bucket.get(target.objectKey);
     if (!object) {
       return new Response("Not Found", { status: 404 });
     }
 
     const headers = new Headers();
     object.writeHttpMetadata(headers);
-    const contentType = contentTypeForPath(objectKey);
+    const contentType = contentTypeForPath(target.objectKey);
     if (contentType && !headers.get("content-type")) {
       headers.set("content-type", contentType);
     }
     headers.set("etag", object.httpEtag);
-    headers.set("cache-control", objectKey.toLowerCase().endsWith(".json")
+    headers.set("cache-control", target.objectKey.toLowerCase().endsWith(".json")
       ? "public, max-age=60"
       : "public, max-age=31536000, immutable");
 

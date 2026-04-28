@@ -13,6 +13,7 @@ WRAPPERS = ROOT / "packaging" / "wrappers"
 MISSING_LOCAL_ENV = ROOT / ".tmp" / "test-wrapper-entrypoints" / "missing-local.env"
 
 CONFIG_NAMES = {
+    "MONITOR_RELEASE_CHANNEL",
     "MONITOR_UPDATE_SIGNING_PUBLIC_KEY_PATH",
     "MONITOR_UPDATE_SIGNING_KEY_PATH",
     "MONITOR_UPDATE_BASE_URL",
@@ -21,6 +22,8 @@ CONFIG_NAMES = {
     "MONITOR_UPDATE_MANIFEST_URL",
     "MONITOR_KEY_ESTACIONES",
     "MONITOR_KEY_REPORTES",
+    "MONITOR_LOCAL_DATA_SUBDIR",
+    "MONITOR_UPDATE_ARTIFACT_PREFIX",
     "MONITOR_DEBUG_PANEL_VISIBLE",
     "UPDATE_R2_ENDPOINT",
     "UPDATE_R2_BUCKET",
@@ -87,7 +90,6 @@ class WrapperEntrypointsTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Missing required configuration", result.stdout)
         self.assertIn("UPDATE_R2_ENDPOINT", result.stdout)
-        self.assertIn("UPDATE_R2_BUCKET", result.stdout)
         self.assertIn("UPDATE_R2_ACCESS_KEY", result.stdout)
         self.assertIn("UPDATE_R2_SECRET_KEY", result.stdout)
         self.assertNotIn(">>>", result.stdout)
@@ -112,6 +114,7 @@ class WrapperEntrypointsTest(unittest.TestCase):
         template = (ROOT / "packaging" / "local.env.template").read_text(encoding="utf-8")
 
         self.assertIn("/packaging/local.env", gitignore)
+        self.assertIn("MONITOR_RELEASE_CHANNEL=", template)
         self.assertIn("MONITOR_UPDATE_SIGNING_PUBLIC_KEY_PATH=", template)
         self.assertIn("UPDATE_R2_SECRET_KEY=", template)
 
@@ -167,6 +170,60 @@ class WrapperEntrypointsTest(unittest.TestCase):
         self.assertIn("MANIFEST=https://local.example/updates/latest.json", result.stdout)
         self.assertIn("BASE=https://local.example/updates", result.stdout)
         self.assertIn("KEY=.tmp\\signer-test\\monitor-update-public.pem", result.stdout)
+
+    def test_channel_defaults_select_channel_specific_local_env_file(self) -> None:
+        scratch_root = ROOT / ".tmp" / "test-wrapper-entrypoints"
+        work_dir = scratch_root / uuid.uuid4().hex
+        wrappers_dir = work_dir / "packaging" / "wrappers"
+        packaging_dir = wrappers_dir.parent
+        wrappers_dir.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(work_dir, ignore_errors=True))
+
+        (packaging_dir / "local.env").write_text(
+            "MONITOR_PRIMARY_BASE_URL=https://default.example/data\n",
+            encoding="utf-8",
+        )
+        (packaging_dir / "local.release.env").write_text(
+            "MONITOR_PRIMARY_BASE_URL=https://release.example/data\n",
+            encoding="utf-8",
+        )
+        (packaging_dir / "local.development.env").write_text(
+            "MONITOR_PRIMARY_BASE_URL=https://development.example/data\n",
+            encoding="utf-8",
+        )
+
+        for channel, expected_env_name, expected_base_url in (
+            ("release", "local.release.env", "https://release.example/data"),
+            ("development", "local.development.env", "https://development.example/data"),
+        ):
+            with self.subTest(channel=channel):
+                env = self._clean_env()
+                command = (
+                    f". '{WRAPPERS / 'common.ps1'}'; "
+                    f"$ctx = Initialize-PackagingWrapper -ScriptRoot '{wrappers_dir}' -Channel '{channel}'; "
+                    'Write-Output "LOCAL_ENV=$($ctx.LocalEnvPath)"; '
+                    'Write-Output "PRIMARY=$env:MONITOR_PRIMARY_BASE_URL"'
+                )
+
+                result = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        command,
+                    ],
+                    cwd=ROOT,
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                )
+
+                self.assertIn(f"LOCAL_ENV={packaging_dir / expected_env_name}", result.stdout)
+                self.assertIn(f"PRIMARY={expected_base_url}", result.stdout)
 
 
 if __name__ == "__main__":

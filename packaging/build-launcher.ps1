@@ -4,6 +4,7 @@
     [string]$DotnetExe = "",
     [string]$SourceRoot = "",
     [string]$UpdateSigningPublicKeyPath = "",
+    [string]$OutputDir = "",
     [switch]$FrameworkDependent
 )
 
@@ -14,7 +15,11 @@ $paths = Get-CompilePaths -SourceRoot $SourceRoot
 
 $root = $paths.SourceRoot
 $project = Join-Path $PSScriptRoot "launcher\MonitorSMSLauncher.csproj"
-$distDir = Join-Path $paths.DistPath "MonitorSMSLauncher"
+if (-not $OutputDir) {
+    $OutputDir = Join-Path $paths.DistPath "MonitorSMSLauncher"
+}
+
+$distDir = $OutputDir
 
 if (-not (Test-Path $project)) {
     Write-Error "Launcher project not found: $project"

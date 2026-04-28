@@ -3,6 +3,7 @@ param(
     [string]$MsiPath = "",
     [string]$Output = "",
     [string]$SourceRoot = "",
+    [string]$Channel = "",
     [string]$RuntimeUrl = "",
     [string]$RuntimeFile = "",
     [string]$RuntimeSha256 = "",
@@ -12,7 +13,12 @@ param(
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "paths.ps1")
+. (Join-Path $PSScriptRoot "channel.ps1")
 $paths = Get-CompilePaths -SourceRoot $SourceRoot
+$resolvedChannel = Resolve-MonitorChannel -Channel $Channel
+$artifactPrefix = Get-ChannelArtifactPrefix -Channel $resolvedChannel
+$productDisplayName = Get-ChannelProductDisplayName -Channel $resolvedChannel
+$bundleUpgradeCode = Get-ChannelBundleUpgradeCode -Channel $resolvedChannel
 
 $root = $paths.SourceRoot
 $bundleWxs = Join-Path $PSScriptRoot "wix\MonitorSMS.bundle.wxs"
@@ -56,6 +62,95 @@ function Resolve-WixCommand {
     return $null
 }
 
+function Get-WixToolVersion {
+    param(
+        [pscustomobject]$WixCommand
+    )
+
+    $output = & $WixCommand.Executable @($WixCommand.PrefixArgs + @("--version")) 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $output) {
+        return ""
+    }
+
+    $line = ($output | Select-Object -First 1).ToString().Trim()
+    $match = [regex]::Match($line, "\d+\.\d+\.\d+")
+    if ($match.Success) {
+        return $match.Value
+    }
+
+    return ""
+}
+
+function Get-WixInstalledExtensions {
+    param(
+        [pscustomobject]$WixCommand
+    )
+
+    $output = & $WixCommand.Executable @($WixCommand.PrefixArgs + @("extension", "list", "-g")) 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to query WiX extension cache."
+        exit $LASTEXITCODE
+    }
+
+    $extensions = @{}
+    foreach ($line in $output) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed) {
+            continue
+        }
+
+        $match = [regex]::Match($trimmed, "^(?<id>\S+)\s+(?<version>\S+)(?<damaged>\s+\(damaged\))?$")
+        if (-not $match.Success) {
+            continue
+        }
+
+        $extensions[$match.Groups["id"].Value] = [pscustomobject]@{
+            Version = $match.Groups["version"].Value
+            Damaged = $match.Groups["damaged"].Success
+        }
+    }
+
+    return $extensions
+}
+
+function Ensure-WixExtensions {
+    param(
+        [pscustomobject]$WixCommand,
+        [string[]]$RequiredExtensions
+    )
+
+    $installed = Get-WixInstalledExtensions -WixCommand $WixCommand
+    $wixVersion = Get-WixToolVersion -WixCommand $WixCommand
+
+    foreach ($extensionId in $RequiredExtensions) {
+        if ($installed.ContainsKey($extensionId)) {
+            $entry = $installed[$extensionId]
+            if (-not $entry.Damaged) {
+                continue
+            }
+
+            Write-Host "Repairing damaged WiX extension: $extensionId"
+            & $WixCommand.Executable @($WixCommand.PrefixArgs + @("extension", "remove", "-g", $extensionId))
+            if ($LASTEXITCODE -ne 0) {
+                Write-Error "Failed to remove damaged WiX extension: $extensionId"
+                exit $LASTEXITCODE
+            }
+        }
+
+        $extensionRef = $extensionId
+        if ($wixVersion) {
+            $extensionRef = "$extensionId/$wixVersion"
+        }
+
+        Write-Host "Installing missing WiX extension: $extensionRef"
+        & $WixCommand.Executable @($WixCommand.PrefixArgs + @("extension", "add", "-g", $extensionRef))
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to install WiX extension: $extensionRef"
+            exit $LASTEXITCODE
+        }
+    }
+}
+
 if (-not (Test-Path $bundleWxs)) {
     Write-Error "WiX bundle source file not found: $bundleWxs"
     exit 1
@@ -71,18 +166,26 @@ if (-not $Version) {
 }
 
 if (-not $MsiPath) {
-    $MsiPath = Join-Path $paths.ArtifactsPath "MonitorSMS-$Version.msi"
+    $versionArtifactsDir = Get-VersionArtifactsPath -ArtifactsRoot $paths.ArtifactsPath -Version $Version -ArtifactPrefix $artifactPrefix
+    $MsiPath = Join-Path $versionArtifactsDir ("${artifactPrefix}MonitorSMS-$Version.msi")
 }
 
 if (-not (Test-Path $MsiPath)) {
-    & (Join-Path $PSScriptRoot "build-msi.ps1") -Version $Version -Output $MsiPath -SourceRoot $SourceRoot
+    & (Join-Path $PSScriptRoot "build-msi.ps1") -Version $Version -Output $MsiPath -SourceRoot $SourceRoot -Channel $resolvedChannel
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
 }
 
 if (-not $Output) {
-    $Output = Join-Path $paths.ArtifactsPath "MonitorSMS-$Version-setup.exe"
+    $versionArtifactsDir = Get-VersionArtifactsPath -ArtifactsRoot $paths.ArtifactsPath -Version $Version -ArtifactPrefix $artifactPrefix
+    New-Item -ItemType Directory -Path $versionArtifactsDir -Force | Out-Null
+    $Output = Join-Path $versionArtifactsDir ("${artifactPrefix}MonitorSMS-$Version-setup.exe")
+}
+
+$outputDir = Split-Path -Parent $Output
+if ($outputDir -and -not (Test-Path $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 }
 
 if (-not $RuntimeUrl) {
@@ -135,18 +238,26 @@ $env:USERPROFILE\.dotnet\tools\wix.exe
     exit 1
 }
 
+$requiredExtensions = @(
+    "WixToolset.BootstrapperApplications.wixext",
+    "WixToolset.Netfx.wixext"
+)
+Ensure-WixExtensions -WixCommand $wixCommand -RequiredExtensions $requiredExtensions
+
 $embedDefine = "EmbedNet8Runtime=" + ($(if ($EmbedNet8Runtime) { "yes" } else { "no" }))
 
 $args = @(
     "build",
     $bundleWxs,
     "-d", "Version=$Version",
+    "-d", "ProductDisplayName=$productDisplayName",
+    "-d", "BundleUpgradeCode=$bundleUpgradeCode",
     "-d", "MsiPath=$MsiPath",
     "-d", "Net8RuntimeUrl=$RuntimeUrl",
     "-d", "Net8RuntimeFile=$RuntimeFile",
     "-d", $embedDefine,
-    "-ext", "WixToolset.Bal.wixext",
-    "-ext", "WixToolset.NetCore.wixext",
+    "-ext", "WixToolset.BootstrapperApplications.wixext",
+    "-ext", "WixToolset.Netfx.wixext",
     "-o", $Output
 )
 

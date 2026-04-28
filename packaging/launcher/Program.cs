@@ -14,10 +14,15 @@ using System.Windows.Forms;
 static class Program
 {
     private const string AppName = "MonitorSMS";
+    private const string DefaultLocalDataSubdir = "MonitorSMS";
     private const string AppPrefix = "app-";
     private const string DefaultEntryExe = "MonitorSMS.exe";
+    private const string AppAssetsRelativePrefix = "_internal/station_monitor_assets/";
+    private const string AppBaseLibraryRelativePath = "_internal/base_library.zip";
     private const string ManifestEnv = "MONITOR_UPDATE_MANIFEST_URL";
     private const string SkipEnv = "MONITOR_SKIP_UPDATE";
+    private const string LocalDataSubdirEnv = "MONITOR_LOCAL_DATA_SUBDIR";
+    private const string UpdateArtifactPrefixEnv = "MONITOR_UPDATE_ARTIFACT_PREFIX";
     private const string CurrentFile = "current.json";
     private const string LastGoodFile = "last_good.json";
     private const string RuntimeDirName = "runtime";
@@ -28,7 +33,6 @@ static class Program
     private const string LauncherHealthNonceEnv = "MONITOR_LAUNCHER_HEALTH_NONCE";
     private const string LauncherHealthVersionEnv = "MONITOR_LAUNCHER_HEALTH_VERSION";
     private const string LauncherRequireFreshDbEnv = "MONITOR_LAUNCHER_REQUIRE_FRESH_DB";
-    private static readonly string BaselinePattern = "MonitorSMS-*.zip";
     private static readonly TimeSpan CandidateHealthWindow = TimeSpan.FromSeconds(60);
 
     [STAThread]
@@ -38,16 +42,21 @@ static class Program
         Application.SetCompatibleTextRenderingDefault(false);
 
         var installDir = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        var stateRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), AppName);
+        // Load installer-provided .env before resolving channel-specific runtime paths.
+        LoadDotEnv(installDir);
+        var localDataSubdir = ResolveLocalDataSubdir();
+        var artifactPrefix = ResolveUpdateArtifactPrefix();
+        var stateRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), localDataSubdir);
         var runtimeDir = Path.Combine(stateRoot, RuntimeDirName);
         var stageDir = Path.Combine(stateRoot, StageDirName);
         var logger = new LauncherLogger(installDir, stateRoot);
 
-        LoadDotEnv(installDir, logger);
         logger.Info($"Launcher install directory: {installDir}");
         logger.Info($"Launcher state directory: {stateRoot}");
         logger.Info($"Launcher runtime directory: {runtimeDir}");
         logger.Info($"Launcher stage directory: {stageDir}");
+        logger.Info($"Launcher local data subdir: {localDataSubdir}");
+        logger.Info($"Launcher update artifact prefix: {artifactPrefix}");
 
         InstalledApp? current = ReadCurrent(runtimeDir, logger);
         if (current is not null && !IsValidInstalledApp(current.Path, DefaultEntryExe))
@@ -69,7 +78,7 @@ static class Program
 
         if (current is null)
         {
-            current = TryMigrateLegacy(installDir, stateRoot, runtimeDir, logger);
+            current = TryMigrateLegacy(installDir, stateRoot, runtimeDir, artifactPrefix, logger);
         }
 
         if (current is not null)
@@ -77,7 +86,7 @@ static class Program
             EnsureLastGood(runtimeDir, current, logger);
         }
 
-        var baselineZip = FindBaselineZip(installDir);
+        var baselineZip = FindBaselineZip(installDir, artifactPrefix);
         if (current is null)
         {
             if (baselineZip is not null)
@@ -181,31 +190,44 @@ static class Program
         using var progress = new ProgressWindow("Updating MonitorSMS");
         progress.Show();
         logger.Info(
-            manifest.Patch is null
+            manifest.App is null || string.IsNullOrWhiteSpace(manifest.RuntimeId)
                 ? $"Preparing update install for version {manifest.Version} using full ZIP only."
-                : $"Preparing update install for version {manifest.Version}; patch baseline is {manifest.Patch.FromVersion}.");
+                : $"Preparing update install for version {manifest.Version}; manifest runtime_id is {manifest.RuntimeId}.");
         InstalledApp? installed = null;
         if (current is not null &&
-            manifest.Patch is not null &&
-            string.Equals(current.Version, manifest.Patch.FromVersion, StringComparison.OrdinalIgnoreCase))
+            manifest.App is not null &&
+            !string.IsNullOrWhiteSpace(manifest.RuntimeId))
         {
-            logger.Info($"Installed version {current.Version} matches patch baseline {manifest.Patch.FromVersion}; attempting patch update.");
-            installed = InstallFromPatch(manifest, manifest.Patch, current, installDir, runtimeDir, stageDir, logger, progress);
-            if (installed is not null)
+            var installedRuntimeId = ComputeRuntimeId(current.Path, logger);
+            if (!string.IsNullOrWhiteSpace(installedRuntimeId))
             {
-                progress.CloseWindow();
-                return installed;
-            }
+                logger.Info($"Detected installed runtime_id {installedRuntimeId} for version {current.Version}.");
+                logger.Info($"Manifest runtime_id is {manifest.RuntimeId}.");
+                if (string.Equals(installedRuntimeId, manifest.RuntimeId, StringComparison.OrdinalIgnoreCase))
+                {
+                    logger.Info($"Installed runtime_id matches manifest runtime_id; attempting app-only update.");
+                    installed = InstallFromAppOnlyArtifact(manifest, manifest.App, current, runtimeDir, stageDir, logger, progress);
+                    if (installed is not null)
+                    {
+                        progress.CloseWindow();
+                        return installed;
+                    }
 
-            logger.Warn($"Patch update from {manifest.Patch.FromVersion} to {manifest.Version} failed; falling back to full ZIP.");
+                    logger.Warn($"App-only update for version {manifest.Version} failed; falling back to full ZIP.");
+                }
+                else
+                {
+                    logger.Info($"Installed runtime_id does not match manifest runtime_id; using full ZIP.");
+                }
+            }
         }
-        else if (current is not null && manifest.Patch is not null)
+        else if (current is not null && manifest.App is not null)
         {
-            logger.Info($"Installed version {current.Version} does not match patch baseline {manifest.Patch.FromVersion}; using full ZIP.");
+            logger.Info("App-only metadata is incomplete because runtime_id is missing; using full ZIP.");
         }
         else if (current is null)
         {
-            logger.Info("No installed runtime version is available for patch eligibility; using full ZIP.");
+            logger.Info("No installed runtime version is available for app-only eligibility; using full ZIP.");
         }
 
         var fullArtifact = new UpdateArtifact(manifest.Url, manifest.Sha256, manifest.SignatureUrl);
@@ -236,20 +258,19 @@ static class Program
         return InstallFromZip(download, version, installDir, runtimeDir, stageDir, entryExe, cleanupZip: true, logger, progress);
     }
 
-    private static InstalledApp? InstallFromPatch(
+    private static InstalledApp? InstallFromAppOnlyArtifact(
         UpdateManifest manifest,
-        PatchArtifact patch,
+        UpdateArtifact appArtifact,
         InstalledApp current,
-        string installDir,
         string runtimeDir,
         string stageDir,
         LauncherLogger logger,
         ProgressWindow? progress)
     {
-        logger.Info($"Starting patch install from version {current.Version} to {manifest.Version} using {patch.Url}.");
+        logger.Info($"Starting app-only install from version {current.Version} to {manifest.Version} using {appArtifact.Url}.");
         var download = DownloadVerifiedArtifact(
-            new UpdateArtifact(patch.Url, patch.Sha256, patch.SignatureUrl),
-            "patch update",
+            appArtifact,
+            "app-only update",
             stageDir,
             logger,
             progress);
@@ -260,8 +281,8 @@ static class Program
 
         try
         {
-            progress?.SetStatus("Applying patch update...");
-            return InstallFromPatchZip(download, manifest.Version, patch.FromVersion, current, runtimeDir, stageDir, logger, progress);
+            progress?.SetStatus("Applying app-only update...");
+            return InstallFromAppZip(download, manifest.Version, current, runtimeDir, stageDir, logger, progress);
         }
         finally
         {
@@ -315,10 +336,9 @@ static class Program
         return download;
     }
 
-    private static InstalledApp? InstallFromPatchZip(
-        string patchZipPath,
+    private static InstalledApp? InstallFromAppZip(
+        string appZipPath,
         string version,
-        string expectedFromVersion,
         InstalledApp current,
         string runtimeDir,
         string stageDir,
@@ -335,26 +355,26 @@ static class Program
             stageRoot = Path.Combine(stageDir, Guid.NewGuid().ToString("N"));
             var extractRoot = Path.Combine(stageRoot, "extract");
             Directory.CreateDirectory(extractRoot);
-            ExtractZipWithProgress(patchZipPath, extractRoot, progress, logger);
+            ExtractZipWithProgress(appZipPath, extractRoot, progress, logger);
 
-            var patchMetadata = ReadPatchMetadata(extractRoot, logger);
-            if (patchMetadata is null)
+            var payloadRoot = ResolvePayloadRoot(extractRoot, DefaultEntryExe);
+            if (payloadRoot is null)
             {
-                return null;
-            }
-            logger.Info(
-                $"Loaded patch metadata from {patchMetadata.FromVersion} to {patchMetadata.ToVersion} with {patchMetadata.DeletePaths.Length} delete path(s).");
-
-            if (!string.Equals(patchMetadata.FromVersion, expectedFromVersion, StringComparison.OrdinalIgnoreCase) ||
-                !string.Equals(patchMetadata.FromVersion, current.Version, StringComparison.OrdinalIgnoreCase))
-            {
-                logger.Warn($"Patch baseline version mismatch. Expected {expectedFromVersion}, found {patchMetadata.FromVersion}.");
+                logger.Warn($"Extracted app-only payload missing {DefaultEntryExe}.");
                 return null;
             }
 
-            if (!string.Equals(patchMetadata.ToVersion, version, StringComparison.OrdinalIgnoreCase))
+            var sourceExe = Path.Combine(payloadRoot, DefaultEntryExe);
+            var sourceAssets = Path.Combine(payloadRoot, "_internal", "station_monitor_assets");
+            var sourceBaseLibrary = Path.Combine(payloadRoot, "_internal", "base_library.zip");
+            if (!File.Exists(sourceExe))
             {
-                logger.Warn($"Patch target version mismatch. Expected {version}, found {patchMetadata.ToVersion}.");
+                logger.Warn("Extracted app-only payload is missing MonitorSMS.exe.");
+                return null;
+            }
+            if (!Directory.Exists(sourceAssets))
+            {
+                logger.Warn("Extracted app-only payload is missing _internal\\station_monitor_assets.");
                 return null;
             }
 
@@ -369,32 +389,45 @@ static class Program
             logger.Info($"Copying existing runtime from {current.Path} into candidate folder {targetDir}.");
             DirectoryCopy(current.Path, targetDir, true);
 
-            progress?.SetStatus("Applying patch files...");
+            progress?.SetStatus("Applying app-only files...");
             progress?.SetIndeterminate();
-            var overlaidFiles = OverlayDirectory(extractRoot, targetDir, logger);
-            var deletedPaths = ApplyDeletePaths(targetDir, patchMetadata.DeletePaths, logger);
-            logger.Info($"Applied {overlaidFiles} patched file(s) and removed {deletedPaths} stale path(s) for version {version}.");
-
-            var entryExe = patchMetadata.EntryExe;
-            if (string.IsNullOrWhiteSpace(entryExe))
+            var targetExe = Path.Combine(targetDir, DefaultEntryExe);
+            var targetAssets = Path.Combine(targetDir, "_internal", "station_monitor_assets");
+            var targetBaseLibrary = Path.Combine(targetDir, "_internal", "base_library.zip");
+            File.Copy(sourceExe, targetExe, overwrite: true);
+            if (Directory.Exists(targetAssets))
             {
-                logger.Warn("Patch metadata is missing entry_exe.");
+                Directory.Delete(targetAssets, recursive: true);
+            }
+            DirectoryCopy(sourceAssets, targetAssets, true);
+            if (File.Exists(sourceBaseLibrary))
+            {
+                var targetBaseLibraryDir = Path.GetDirectoryName(targetBaseLibrary);
+                if (!string.IsNullOrWhiteSpace(targetBaseLibraryDir))
+                {
+                    Directory.CreateDirectory(targetBaseLibraryDir);
+                }
+                File.Copy(sourceBaseLibrary, targetBaseLibrary, overwrite: true);
+            }
+            else
+            {
+                logger.Warn("Extracted app-only payload is missing _internal\\base_library.zip; keeping existing base_library.zip from current runtime.");
+            }
+            logger.Info($"Applied app-only update contents for version {version}: MonitorSMS.exe and station_monitor_assets (plus base_library.zip when present in payload).");
+
+            if (!IsValidInstalledApp(targetDir, DefaultEntryExe))
+            {
+                logger.Warn($"App-only payload produced an invalid runtime layout for {targetDir}.");
                 return null;
             }
 
-            if (!IsValidInstalledApp(targetDir, entryExe))
-            {
-                logger.Warn($"Patched payload missing {entryExe} or _internal.");
-                return null;
-            }
-
-            logger.Info($"Installed patched version {version} into {targetDir}");
+            logger.Info($"Installed app-only version {version} into {targetDir}");
             installed = new InstalledApp(version, targetDir);
             return installed;
         }
         catch (Exception ex)
         {
-            logger.Warn($"Patch install failed: {ex.Message}");
+            logger.Warn($"App-only install failed: {ex.Message}");
             return null;
         }
         finally
@@ -428,159 +461,105 @@ static class Program
         }
     }
 
-    private static PatchPackage? ReadPatchMetadata(string extractRoot, LauncherLogger logger)
+    private static string? ComputeRuntimeId(string appDir, LauncherLogger logger)
     {
-        var patchMetadataPath = Path.Combine(extractRoot, "patch.json");
-        if (!File.Exists(patchMetadataPath))
-        {
-            logger.Warn("Patch payload is missing patch.json.");
-            return null;
-        }
-
         try
         {
-            using var doc = JsonDocument.Parse(File.ReadAllText(patchMetadataPath, Encoding.UTF8));
-            var root = doc.RootElement;
-            var fromVersion = root.TryGetProperty("from_version", out var fromElement) ? fromElement.GetString() : null;
-            var toVersion = root.TryGetProperty("to_version", out var toElement) ? toElement.GetString() : null;
-            var entryExe = root.TryGetProperty("entry_exe", out var entryElement) ? entryElement.GetString() : null;
-            if (string.IsNullOrWhiteSpace(fromVersion) || string.IsNullOrWhiteSpace(toVersion) || string.IsNullOrWhiteSpace(entryExe))
+            var runtimeEntries = GetRuntimeEntries(appDir, logger);
+            if (runtimeEntries.Count == 0)
             {
-                logger.Warn("Patch metadata is missing from_version, to_version, or entry_exe.");
+                logger.Warn($"Runtime fingerprint inventory is empty for {appDir}.");
                 return null;
             }
 
-            var deletePaths = new List<string>();
-            if (root.TryGetProperty("delete_paths", out var deleteElement))
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            foreach (var entry in runtimeEntries)
             {
-                if (deleteElement.ValueKind != JsonValueKind.Array)
-                {
-                    logger.Warn("Patch metadata delete_paths is not an array.");
-                    return null;
-                }
-
-                foreach (var item in deleteElement.EnumerateArray())
-                {
-                    if (item.ValueKind != JsonValueKind.String)
-                    {
-                        logger.Warn("Patch metadata delete_paths contains a non-string entry.");
-                        return null;
-                    }
-
-                    var deletePath = item.GetString();
-                    if (!string.IsNullOrWhiteSpace(deletePath))
-                    {
-                        deletePaths.Add(deletePath);
-                    }
-                }
+                hash.AppendData(Encoding.UTF8.GetBytes(entry.RelativePath));
+                hash.AppendData(new byte[] { 0 });
+                hash.AppendData(Encoding.UTF8.GetBytes(entry.Sha256));
+                hash.AppendData(new byte[] { (byte)'\n' });
             }
 
-            logger.Info(
-                $"Patch metadata validated for {fromVersion} -> {toVersion} with entry executable {entryExe} and {deletePaths.Count} delete path(s).");
-            return new PatchPackage(fromVersion!, toVersion!, entryExe!, deletePaths.ToArray());
+            var runtimeId = Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
+            logger.Info($"Computed runtime_id {runtimeId} from {runtimeEntries.Count} runtime file(s) under {appDir}.");
+            return runtimeId;
         }
         catch (Exception ex)
         {
-            logger.Warn($"Failed to read patch metadata: {ex.Message}");
+            logger.Warn($"Failed to compute runtime_id for {appDir}: {ex.Message}");
             return null;
         }
     }
 
-    private static int OverlayDirectory(string sourceRoot, string targetRoot, LauncherLogger logger)
+    private static List<RuntimeEntry> GetRuntimeEntries(string appDir, LauncherLogger logger)
     {
-        var copiedFiles = 0;
-        foreach (var file in Directory.GetFiles(sourceRoot, "*", SearchOption.AllDirectories))
+        var runtimeRoot = Path.Combine(appDir, "_internal");
+        if (!Directory.Exists(runtimeRoot))
         {
-            var relativePath = Path.GetRelativePath(sourceRoot, file);
-            if (string.Equals(relativePath, "patch.json", StringComparison.OrdinalIgnoreCase))
+            throw new DirectoryNotFoundException($"Runtime folder not found: {runtimeRoot}");
+        }
+
+        var entries = new List<RuntimeEntry>();
+        foreach (var file in Directory.GetFiles(runtimeRoot, "*", SearchOption.AllDirectories))
+        {
+            var relativePath = Path.GetRelativePath(appDir, file).Replace('\\', '/');
+            if (IsRuntimeAssetPath(relativePath))
             {
                 continue;
             }
 
-            var destination = ResolveRelativePathWithinRoot(targetRoot, relativePath);
-            if (destination is null)
-            {
-                logger.Warn($"Patch file rejected due to invalid relative path: {relativePath}");
-                throw new InvalidDataException($"Patch file escapes runtime directory: {relativePath}");
-            }
-
-            var destinationDir = Path.GetDirectoryName(destination);
-            if (!string.IsNullOrEmpty(destinationDir))
-            {
-                Directory.CreateDirectory(destinationDir);
-            }
-
-            File.Copy(file, destination, overwrite: true);
-            copiedFiles++;
+            entries.Add(new RuntimeEntry(relativePath, Sha256File(file)));
         }
-
-        return copiedFiles;
+        entries.Sort((left, right) => string.CompareOrdinal(left.RelativePath, right.RelativePath));
+        logger.Info($"Prepared runtime fingerprint inventory with {entries.Count} runtime file(s) for {appDir}.");
+        return entries;
     }
 
-    private static int ApplyDeletePaths(string targetRoot, string[] deletePaths, LauncherLogger logger)
+    private static bool IsRuntimeAssetPath(string relativePath)
     {
-        var removedPaths = 0;
-        Array.Sort(deletePaths, (left, right) =>
-        {
-            var leftDepth = CountPathDepth(left);
-            var rightDepth = CountPathDepth(right);
-            return rightDepth.CompareTo(leftDepth);
-        });
-
-        foreach (var deletePath in deletePaths)
-        {
-            var fullPath = ResolveRelativePathWithinRoot(targetRoot, deletePath);
-            if (fullPath is null)
-            {
-                logger.Warn($"Patch delete path rejected due to invalid relative path: {deletePath}");
-                throw new InvalidDataException($"Patch delete path escapes runtime directory: {deletePath}");
-            }
-
-            if (File.Exists(fullPath))
-            {
-                File.Delete(fullPath);
-                removedPaths++;
-                continue;
-            }
-
-            if (Directory.Exists(fullPath))
-            {
-                Directory.Delete(fullPath, recursive: true);
-                removedPaths++;
-            }
-        }
-
-        return removedPaths;
+        return relativePath.StartsWith(AppAssetsRelativePrefix, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(relativePath, AppBaseLibraryRelativePath, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static int CountPathDepth(string relativePath)
+    private static string ResolveLocalDataSubdir()
     {
-        var depth = 0;
-        foreach (var character in relativePath)
+        var configured = Environment.GetEnvironmentVariable(LocalDataSubdirEnv);
+        if (string.IsNullOrWhiteSpace(configured))
         {
-            if (character == '/' || character == '\\')
-            {
-                depth++;
-            }
+            return DefaultLocalDataSubdir;
         }
 
-        return depth;
-    }
-
-    private static string? ResolveRelativePathWithinRoot(string rootPath, string relativePath)
-    {
-        if (string.IsNullOrWhiteSpace(relativePath) || Path.IsPathRooted(relativePath))
+        var subdir = configured.Trim();
+        if (subdir.IndexOfAny(new[] { '/', '\\', ':', '*', '?', '"', '<', '>', '|' }) >= 0)
         {
-            return null;
+            return DefaultLocalDataSubdir;
         }
 
-        var fullPath = Path.GetFullPath(Path.Combine(rootPath, relativePath));
-        return IsPathWithinRoot(rootPath, fullPath) ? fullPath : null;
+        return subdir;
     }
 
-    private static (string version, string path)? FindBaselineZip(string installDir)
+    private static string ResolveUpdateArtifactPrefix()
     {
-        var files = Directory.GetFiles(installDir, BaselinePattern, SearchOption.TopDirectoryOnly);
+        var configured = Environment.GetEnvironmentVariable(UpdateArtifactPrefixEnv);
+        if (string.IsNullOrWhiteSpace(configured))
+        {
+            return string.Empty;
+        }
+
+        var prefix = configured.Trim();
+        if (prefix.IndexOfAny(new[] { '/', '\\', ':', '*', '?', '"', '<', '>', '|' }) >= 0)
+        {
+            return string.Empty;
+        }
+
+        return prefix;
+    }
+
+    private static (string version, string path)? FindBaselineZip(string installDir, string artifactPrefix)
+    {
+        var artifactNamePrefix = $"{artifactPrefix}MonitorSMS-";
+        var files = Directory.GetFiles(installDir, $"{artifactNamePrefix}*.zip", SearchOption.TopDirectoryOnly);
         if (files.Length == 0)
         {
             return null;
@@ -591,11 +570,11 @@ static class Program
         foreach (var file in files)
         {
             var name = Path.GetFileNameWithoutExtension(file);
-            if (!name.StartsWith("MonitorSMS-", StringComparison.OrdinalIgnoreCase))
+            if (!name.StartsWith(artifactNamePrefix, StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
-            var version = name["MonitorSMS-".Length..];
+            var version = name[artifactNamePrefix.Length..];
             if (string.IsNullOrWhiteSpace(version))
             {
                 continue;
@@ -610,9 +589,9 @@ static class Program
         return bestPath is null ? null : (bestVersion!, bestPath);
     }
 
-    private static string? GetBaselineVersion(string installDir)
+    private static string? GetBaselineVersion(string installDir, string artifactPrefix)
     {
-        var baseline = FindBaselineZip(installDir);
+        var baseline = FindBaselineZip(installDir, artifactPrefix);
         return baseline?.version;
     }
 
@@ -642,24 +621,31 @@ static class Program
             var sha = root.TryGetProperty("sha256", out var s) ? s.GetString() : null;
             var entry = root.TryGetProperty("entry_exe", out var e) ? e.GetString() : null;
             var downloadSignature = root.TryGetProperty("signature_url", out var sigUrl) ? sigUrl.GetString() : null;
-            PatchArtifact? patch = null;
-            var patchFromVersion = root.TryGetProperty("patch_from_version", out var patchFromElement) ? patchFromElement.GetString() : null;
-            var patchUrl = root.TryGetProperty("patch_url", out var patchUrlElement) ? patchUrlElement.GetString() : null;
-            if (!string.IsNullOrWhiteSpace(patchFromVersion) || !string.IsNullOrWhiteSpace(patchUrl))
+            UpdateArtifact? app = null;
+            var runtimeId = root.TryGetProperty("runtime_id", out var runtimeElement) ? runtimeElement.GetString() : null;
+            var appUrl = root.TryGetProperty("app_url", out var appUrlElement) ? appUrlElement.GetString() : null;
+            if (!string.IsNullOrWhiteSpace(runtimeId) || !string.IsNullOrWhiteSpace(appUrl))
             {
-                if (string.IsNullOrWhiteSpace(patchFromVersion) || string.IsNullOrWhiteSpace(patchUrl))
+                if (string.IsNullOrWhiteSpace(runtimeId) ||
+                    string.IsNullOrWhiteSpace(appUrl))
                 {
-                    logger.Warn("Manifest patch fields are incomplete; ignoring patch artifact.");
+                    logger.Warn("Manifest app-only fields are incomplete; ignoring app-only artifact.");
                 }
                 else
                 {
-                    var patchSha = root.TryGetProperty("patch_sha256", out var patchShaElement) ? patchShaElement.GetString() : null;
-                    var patchSignatureUrl = root.TryGetProperty("patch_signature_url", out var patchSignatureElement) ? patchSignatureElement.GetString() : null;
-                    patch = new PatchArtifact(
-                        patchFromVersion!,
-                        patchUrl!,
-                        string.IsNullOrWhiteSpace(patchSha) ? null : patchSha,
-                        string.IsNullOrWhiteSpace(patchSignatureUrl) ? BuildSignatureUrl(patchUrl!) : patchSignatureUrl!);
+                    var appSha = root.TryGetProperty("app_sha256", out var appShaElement) ? appShaElement.GetString() : null;
+                    var appSignatureUrl = root.TryGetProperty("app_signature_url", out var appSignatureElement) ? appSignatureElement.GetString() : null;
+                    if (string.IsNullOrWhiteSpace(appSignatureUrl))
+                    {
+                        logger.Warn("Manifest app-only fields are incomplete; ignoring app-only artifact.");
+                    }
+                    else
+                    {
+                        app = new UpdateArtifact(
+                            appUrl!,
+                            string.IsNullOrWhiteSpace(appSha) ? null : appSha,
+                            appSignatureUrl!);
+                    }
                 }
             }
 
@@ -669,7 +655,8 @@ static class Program
                 string.IsNullOrWhiteSpace(sha) ? null : sha,
                 string.IsNullOrWhiteSpace(entry) ? DefaultEntryExe : entry!,
                 string.IsNullOrWhiteSpace(downloadSignature) ? BuildSignatureUrl(download!) : downloadSignature!,
-                patch
+                string.IsNullOrWhiteSpace(runtimeId) ? null : runtimeId,
+                app
             );
         }
         catch (Exception ex)
@@ -1558,7 +1545,7 @@ static class Program
         }
     }
 
-    private static InstalledApp? TryMigrateLegacy(string installDir, string stateRoot, string runtimeDir, LauncherLogger logger)
+    private static InstalledApp? TryMigrateLegacy(string installDir, string stateRoot, string runtimeDir, string artifactPrefix, LauncherLogger logger)
     {
         var legacyExe = Path.Combine(installDir, DefaultEntryExe);
         var legacyInternal = Path.Combine(installDir, "_internal");
@@ -1570,7 +1557,7 @@ static class Program
         try
         {
             CloseRunningApp(DefaultEntryExe, logger);
-            var version = ReadLegacyVersion(stateRoot, logger) ?? GetBaselineVersion(installDir) ?? "0.0.0";
+            var version = ReadLegacyVersion(stateRoot, logger) ?? GetBaselineVersion(installDir, artifactPrefix) ?? "0.0.0";
             var targetDir = Path.Combine(runtimeDir, $"{AppPrefix}{version}");
             if (Directory.Exists(targetDir))
             {
@@ -1657,7 +1644,7 @@ static class Program
         return value.Trim().ToLowerInvariant() is "1" or "true" or "yes" or "on";
     }
 
-    private static void LoadDotEnv(string installDir, LauncherLogger logger)
+    private static void LoadDotEnv(string installDir, LauncherLogger? logger = null)
     {
         var envPath = Path.Combine(installDir, ".env");
         if (!File.Exists(envPath))
@@ -1686,7 +1673,7 @@ static class Program
         }
         catch (Exception ex)
         {
-            logger.Warn($"Failed to load .env: {ex.Message}");
+            logger?.Warn($"Failed to load .env: {ex.Message}");
         }
     }
 
@@ -1886,7 +1873,6 @@ static class Program
     private sealed record HealthMarkerResult(HealthMarkerState State, string Reason);
     private sealed record InstalledApp(string Version, string Path);
     private sealed record UpdateArtifact(string Url, string? Sha256, string SignatureUrl);
-    private sealed record PatchArtifact(string FromVersion, string Url, string? Sha256, string SignatureUrl);
-    private sealed record PatchPackage(string FromVersion, string ToVersion, string EntryExe, string[] DeletePaths);
-    private sealed record UpdateManifest(string Version, string Url, string? Sha256, string EntryExe, string SignatureUrl, PatchArtifact? Patch);
+    private sealed record RuntimeEntry(string RelativePath, string Sha256);
+    private sealed record UpdateManifest(string Version, string Url, string? Sha256, string EntryExe, string SignatureUrl, string? RuntimeId, UpdateArtifact? App);
 }
