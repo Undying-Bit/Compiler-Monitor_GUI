@@ -110,7 +110,11 @@ static class Program
             var manifestUrl = Environment.GetEnvironmentVariable(ManifestEnv);
             if (!string.IsNullOrWhiteSpace(manifestUrl))
             {
-                var manifest = FetchManifest(manifestUrl, logger);
+                var manifest = FetchManifestWithProgress(
+                    manifestUrl,
+                    logger,
+                    "Installing MonitorSMS",
+                    "Checking for updates...");
                 if (manifest is not null)
                 {
                     var installed = InstallFromManifest(manifest, installDir, runtimeDir, stageDir, current: null, logger);
@@ -593,6 +597,20 @@ static class Program
     {
         var baseline = FindBaselineZip(installDir, artifactPrefix);
         return baseline?.version;
+    }
+
+    private static UpdateManifest? FetchManifestWithProgress(
+        string url,
+        LauncherLogger logger,
+        string title,
+        string status)
+    {
+        using var progress = new ProgressWindow(title);
+        progress.Show();
+        progress.SetStatus(status);
+        var manifest = FetchManifest(url, logger);
+        progress.CloseWindow();
+        return manifest;
     }
 
     private static UpdateManifest? FetchManifest(string url, LauncherLogger logger)

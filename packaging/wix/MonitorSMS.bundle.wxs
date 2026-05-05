@@ -13,7 +13,7 @@
   <?endif?>
   <Bundle
     Name="$(var.ProductDisplayName)"
-    Manufacturer="Internal Tools"
+    Manufacturer="CIRES A.C."
     Version="$(var.Version)"
     UpgradeCode="$(var.BundleUpgradeCode)">
 
