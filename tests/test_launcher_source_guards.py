@@ -44,6 +44,33 @@ class LauncherSourceGuardsTest(unittest.TestCase):
         self.assertNotIn("PatchArtifact", source)
         self.assertNotIn("patch.json", source)
 
+    def test_launcher_telemetry_includes_user_and_os_metadata(self) -> None:
+        source = PROGRAM.read_text(encoding="utf-8")
+        telemetry_event = (ROOT / "packaging" / "launcher" / "Telemetry" / "TelemetryEvent.cs").read_text(encoding="utf-8")
+        telemetry_service = (ROOT / "packaging" / "launcher" / "Telemetry" / "TelemetryService.cs").read_text(encoding="utf-8")
+        telemetry_schema = (ROOT / "packaging" / "worker" / "schema.sql").read_text(encoding="utf-8")
+        telemetry_worker = (ROOT / "packaging" / "worker" / "src" / "index.ts").read_text(encoding="utf-8")
+
+        self.assertIn('JsonPropertyName("session_id")', telemetry_event)
+        self.assertIn('JsonPropertyName("app_version")', telemetry_event)
+        self.assertIn('JsonPropertyName("launcher_version")', telemetry_event)
+        self.assertIn('JsonPropertyName("user_name")', telemetry_event)
+        self.assertIn('JsonPropertyName("os_description")', telemetry_event)
+        self.assertIn("Environment.UserName", telemetry_service)
+        self.assertIn("Environment.UserDomainName", telemetry_service)
+        self.assertIn("RuntimeInformation.OSDescription", telemetry_service)
+        self.assertIn("RuntimeInformation.OSArchitecture.ToString()", telemetry_service)
+        self.assertIn("public void SetAppVersion(string? appVersion)", telemetry_service)
+        self.assertIn("telemetry.SetAppVersion(current?.Version);", source)
+        self.assertIn("installed_app_version = current?.Version", source)
+        self.assertIn("user_name TEXT", telemetry_schema)
+        self.assertIn("os_description TEXT", telemetry_schema)
+        self.assertIn("idx_telemetry_user_received", telemetry_schema)
+        self.assertIn('"session_id"', telemetry_worker)
+        self.assertIn('"app_version"', telemetry_worker)
+        self.assertIn("getNullableString(payload, \"launcher_session_id\", \"session_id\")", telemetry_worker)
+        self.assertIn("getNullableString(payload, \"launcher_version\", \"app_version\")", telemetry_worker)
+
     def test_update_manifest_is_written_without_bom(self) -> None:
         source = MAKE_UPDATE.read_text(encoding="utf-8")
 

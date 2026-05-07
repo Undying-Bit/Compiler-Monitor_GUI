@@ -33,9 +33,21 @@ The shipped desktop client supports only non-secret runtime configuration:
 - `MONITOR_KEY_REPORTES`
 - `MONITOR_UPDATE_MANIFEST_URL`
 - `MONITOR_DEBUG_PANEL_VISIBLE`
+- `MONITOR_TELEMETRY_ENABLED`
+- `MONITOR_TELEMETRY_ENDPOINT`
+- `MONITOR_TELEMETRY_API_KEY`
+- `MONITOR_TELEMETRY_BATCH_SIZE`
+- `MONITOR_TELEMETRY_TIMEOUT_SECONDS`
 
 Do not put `MONITOR_R2_*`, `MONITOR_B2_*`, `UPDATE_R2_*`, access keys, secret keys, or session tokens in the client config.
 Those values must stay in CI, release automation, or server-side broker infrastructure only.
+
+Telemetry is disabled by default. The launcher sends telemetry only when:
+
+- `MONITOR_TELEMETRY_ENABLED=true`
+- `MONITOR_TELEMETRY_ENDPOINT` is non-empty
+
+`MONITOR_TELEMETRY_API_KEY` is optional and should be treated as a low-risk ingest token, not a privileged cloud credential.
 
 ## Quick Build
 
@@ -212,6 +224,13 @@ Expected install/runtime layout:
   <temporary downloads>
   health\
     candidate-health-<nonce>.json
+%LOCALAPPDATA%\MonitorSMS\telemetry\
+  identity.json
+  first_run_reported.json
+  launcher_queue.jsonl
+
+Launcher telemetry events include a stable `installation_id` plus `user_name`, `user_domain`,
+`os_description`, and `os_architecture` fields to help correlate troubleshooting reports.
 ```
 
 ## Worker / Broker Routing
@@ -220,6 +239,7 @@ The bundled Worker serves two logical routes from R2:
 
 - `/updates/*` for `latest.json`, signatures, and ZIPs
 - `/data/*` for `estaciones.db` and `reportes.db`
+- `POST /telemetry/events` when the launcher is pointed at the shared telemetry Worker
 
 Release bucket bindings:
 
@@ -233,6 +253,10 @@ Development bucket bindings:
 
 If `UPDATE_TOKEN` is configured in the Worker, only `Authorization: Bearer <token>` is accepted.
 Query-string token auth is no longer supported.
+
+If `TELEMETRY_TOKEN` is configured in the Worker, launcher telemetry ingestion requires `Authorization: Bearer <token>`.
+For new databases, apply [packaging/worker/schema.sql](/C:/Users/Administrator/Code/Compile-Monitor_GUI/packaging/worker/schema.sql).
+For existing telemetry databases, also apply [packaging/worker/migrations/0002_add_telemetry_host_metadata.sql](/C:/Users/Administrator/Code/Compile-Monitor_GUI/packaging/worker/migrations/0002_add_telemetry_host_metadata.sql).
 
 ## Uploading Updates
 

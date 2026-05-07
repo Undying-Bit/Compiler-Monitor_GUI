@@ -10,6 +10,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
+using MonitorSMSLauncher.Telemetry;
 
 static class Program
 {
@@ -21,12 +22,15 @@ static class Program
     private const string AppBaseLibraryRelativePath = "_internal/base_library.zip";
     private const string ManifestEnv = "MONITOR_UPDATE_MANIFEST_URL";
     private const string SkipEnv = "MONITOR_SKIP_UPDATE";
+    private const string ChannelEnv = "MONITOR_CHANNEL";
     private const string LocalDataSubdirEnv = "MONITOR_LOCAL_DATA_SUBDIR";
     private const string UpdateArtifactPrefixEnv = "MONITOR_UPDATE_ARTIFACT_PREFIX";
     private const string CurrentFile = "current.json";
     private const string LastGoodFile = "last_good.json";
     private const string RuntimeDirName = "runtime";
     private const string StageDirName = "stage";
+    private const string TelemetryDirName = "telemetry";
+    private const string FirstRunReportedFile = "first_run_reported.json";
     private const string SignatureSuffix = ".sig";
     private const string UpdateSigningKeyResource = "MonitorSMSLauncher.update-signing-public-key.pem";
     private const string LauncherHealthPathEnv = "MONITOR_LAUNCHER_HEALTH_PATH";
@@ -49,7 +53,16 @@ static class Program
         var stateRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), localDataSubdir);
         var runtimeDir = Path.Combine(stateRoot, RuntimeDirName);
         var stageDir = Path.Combine(stateRoot, StageDirName);
+        Directory.CreateDirectory(stateRoot);
+        Directory.CreateDirectory(runtimeDir);
+        Directory.CreateDirectory(stageDir);
         var logger = new LauncherLogger(installDir, stateRoot);
+        var telemetry = new TelemetryService(
+            TelemetrySettings.FromEnvironment(),
+            stateRoot,
+            ResolveLauncherVersion(),
+            ResolveChannel(),
+            logger.Warn);
 
         logger.Info($"Launcher install directory: {installDir}");
         logger.Info($"Launcher state directory: {stateRoot}");
@@ -86,6 +99,19 @@ static class Program
             EnsureLastGood(runtimeDir, current, logger);
         }
 
+        telemetry.SetAppVersion(current?.Version);
+        telemetry.Record(
+            "launcher_started",
+            new
+            {
+                runtime_dir_exists = Directory.Exists(runtimeDir),
+                has_current_json = File.Exists(Path.Combine(runtimeDir, CurrentFile)),
+                has_manifest_url = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(ManifestEnv)),
+                skip_update = IsTruthy(Environment.GetEnvironmentVariable(SkipEnv)),
+                installed_app_version = current?.Version
+            });
+        ReportFirstRunAfterInstall(telemetry, stateRoot);
+
         var baselineZip = FindBaselineZip(installDir, artifactPrefix);
         if (current is null)
         {
@@ -104,7 +130,7 @@ static class Program
                 PromoteInstalledApp(runtimeDir, baseline, rollbackFolderName: null, prune: false, logger);
                 RemoveLegacyInstall(installDir, logger);
                 progress.CloseWindow();
-                return LaunchApp(Path.Combine(baseline.Path, DefaultEntryExe), installDir, Array.Empty<string>(), logger);
+                return LaunchApp(Path.Combine(baseline.Path, DefaultEntryExe), installDir, Array.Empty<string>(), logger, telemetry);
             }
 
             var manifestUrl = Environment.GetEnvironmentVariable(ManifestEnv);
@@ -113,11 +139,12 @@ static class Program
                 var manifest = FetchManifestWithProgress(
                     manifestUrl,
                     logger,
+                    telemetry,
                     "Installing MonitorSMS",
                     "Checking for updates...");
                 if (manifest is not null)
                 {
-                    var installed = InstallFromManifest(manifest, installDir, runtimeDir, stageDir, current: null, logger);
+                    var installed = InstallFromManifest(manifest, installDir, runtimeDir, stageDir, current: null, logger, telemetry);
                     if (installed is null)
                     {
                         ShowError("Update download failed and no baseline is available.");
@@ -125,7 +152,7 @@ static class Program
                     }
                     PromoteInstalledApp(runtimeDir, installed, rollbackFolderName: null, prune: false, logger);
                     RemoveLegacyInstall(installDir, logger);
-                    return LaunchApp(Path.Combine(installed.Path, DefaultEntryExe), installDir, Array.Empty<string>(), logger);
+                    return LaunchApp(Path.Combine(installed.Path, DefaultEntryExe), installDir, Array.Empty<string>(), logger, telemetry);
                 }
             }
 
@@ -137,17 +164,17 @@ static class Program
 
         if (IsTruthy(Environment.GetEnvironmentVariable(SkipEnv)))
         {
-            return LaunchApp(currentExe, installDir, args, logger);
+            return LaunchApp(currentExe, installDir, args, logger, telemetry);
         }
 
         var updateUrl = Environment.GetEnvironmentVariable(ManifestEnv);
         if (!string.IsNullOrWhiteSpace(updateUrl))
         {
-            var manifest = FetchManifest(updateUrl, logger);
+            var manifest = FetchManifest(updateUrl, logger, telemetry);
             if (manifest is not null && CompareVersions(manifest.Version, current.Version) > 0)
             {
                 logger.Info($"Cloud version is newer: {manifest.Version} (installed {current.Version})");
-                var installed = InstallFromManifest(manifest, installDir, runtimeDir, stageDir, current, logger);
+                var installed = InstallFromManifest(manifest, installDir, runtimeDir, stageDir, current, logger, telemetry);
                 if (installed is null)
                 {
                     var choice = MessageBox.Show(
@@ -157,7 +184,7 @@ static class Program
                         MessageBoxIcon.Error);
                     if (choice == DialogResult.Yes)
                     {
-                        return LaunchApp(currentExe, installDir, args, logger);
+                        return LaunchApp(currentExe, installDir, args, logger, telemetry);
                     }
                     return 1;
                 }
@@ -166,7 +193,7 @@ static class Program
                 {
                     rollbackTarget = current;
                 }
-                if (!PromoteCandidateAfterHealth(installed, rollbackTarget, installDir, runtimeDir, stageDir, logger))
+                if (!PromoteCandidateAfterHealth(installed, rollbackTarget, installDir, runtimeDir, stageDir, logger, telemetry))
                 {
                     ShowError("Update rollback failed. Check launcher.log for details.");
                     return 1;
@@ -180,7 +207,7 @@ static class Program
             logger.Warn($"{ManifestEnv} not set; skipping update check.");
         }
 
-        return LaunchApp(currentExe, installDir, args, logger);
+        return LaunchApp(currentExe, installDir, args, logger, telemetry);
     }
 
     private static InstalledApp? InstallFromManifest(
@@ -189,7 +216,8 @@ static class Program
         string runtimeDir,
         string stageDir,
         InstalledApp? current,
-        LauncherLogger logger)
+        LauncherLogger logger,
+        TelemetryService telemetry)
     {
         using var progress = new ProgressWindow("Updating MonitorSMS");
         progress.Show();
@@ -213,10 +241,25 @@ static class Program
                     installed = InstallFromAppOnlyArtifact(manifest, manifest.App, current, runtimeDir, stageDir, logger, progress);
                     if (installed is not null)
                     {
+                        telemetry.Record(
+                            "launcher_app_only_update_completed",
+                            new
+                            {
+                                update_mode = "app_only",
+                                target_version = manifest.Version
+                            });
                         progress.CloseWindow();
                         return installed;
                     }
 
+                    telemetry.Record(
+                        "launcher_app_only_update_failed",
+                        new
+                        {
+                            update_mode = "app_only",
+                            target_version = manifest.Version,
+                            safe_error = "app_only_update_failed"
+                        });
                     logger.Warn($"App-only update for version {manifest.Version} failed; falling back to full ZIP.");
                 }
                 else
@@ -236,6 +279,32 @@ static class Program
 
         var fullArtifact = new UpdateArtifact(manifest.Url, manifest.Sha256, manifest.SignatureUrl);
         installed = InstallFromZipArtifact(fullArtifact, "full update", manifest.Version, installDir, runtimeDir, stageDir, manifest.EntryExe, logger, progress);
+        if (current is not null)
+        {
+            if (installed is null)
+            {
+                telemetry.Record(
+                    "launcher_update_install_failed",
+                    new
+                    {
+                        update_mode = "full",
+                        target_version = manifest.Version,
+                        error_type = "InstallFailed",
+                        safe_error = "install_failed"
+                    });
+            }
+            else
+            {
+                telemetry.Record(
+                    "launcher_update_install_completed",
+                    new
+                    {
+                        update_mode = "full",
+                        target_version = manifest.Version
+                    });
+            }
+        }
+
         progress.CloseWindow();
         return installed;
     }
@@ -599,21 +668,80 @@ static class Program
         return baseline?.version;
     }
 
+    private static string ResolveChannel()
+    {
+        var configured = Environment.GetEnvironmentVariable(ChannelEnv);
+        return string.IsNullOrWhiteSpace(configured) ? "release" : configured.Trim().ToLowerInvariant();
+    }
+
+    private static string ResolveLauncherVersion()
+    {
+        var processPath = Environment.ProcessPath;
+        if (!string.IsNullOrWhiteSpace(processPath))
+        {
+            try
+            {
+                var fileVersion = FileVersionInfo.GetVersionInfo(processPath).FileVersion;
+                if (!string.IsNullOrWhiteSpace(fileVersion))
+                {
+                    return fileVersion;
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        return Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";
+    }
+
+    private static void ReportFirstRunAfterInstall(TelemetryService telemetry, string stateRoot)
+    {
+        try
+        {
+            var telemetryDir = Path.Combine(stateRoot, TelemetryDirName);
+            Directory.CreateDirectory(telemetryDir);
+            var markerPath = Path.Combine(telemetryDir, FirstRunReportedFile);
+            if (File.Exists(markerPath))
+            {
+                return;
+            }
+
+            telemetry.Record(
+                "first_run_after_install",
+                new
+                {
+                    install_layout = "per_user",
+                    channel = ResolveChannel()
+                });
+
+            var markerPayload = JsonSerializer.Serialize(new
+            {
+                reported_at = DateTimeOffset.UtcNow.ToString("O")
+            });
+            File.WriteAllText(markerPath, markerPayload);
+        }
+        catch
+        {
+        }
+    }
+
     private static UpdateManifest? FetchManifestWithProgress(
         string url,
         LauncherLogger logger,
+        TelemetryService telemetry,
         string title,
         string status)
     {
         using var progress = new ProgressWindow(title);
         progress.Show();
         progress.SetStatus(status);
-        var manifest = FetchManifest(url, logger);
+        var manifest = FetchManifest(url, logger, telemetry);
         progress.CloseWindow();
         return manifest;
     }
 
-    private static UpdateManifest? FetchManifest(string url, LauncherLogger logger)
+    private static UpdateManifest? FetchManifest(string url, LauncherLogger logger, TelemetryService telemetry)
     {
         try
         {
@@ -624,6 +752,7 @@ static class Program
             if (!VerifyDataSignature(payload, signature, logger))
             {
                 logger.Warn("Manifest signature verification failed.");
+                RecordUpdateCheckFailed(telemetry, "ManifestValidationFailed");
                 return null;
             }
 
@@ -634,6 +763,7 @@ static class Program
             if (string.IsNullOrWhiteSpace(version) || string.IsNullOrWhiteSpace(download))
             {
                 logger.Warn("Manifest missing required fields: version/url");
+                RecordUpdateCheckFailed(telemetry, "ManifestValidationFailed");
                 return null;
             }
             var sha = root.TryGetProperty("sha256", out var s) ? s.GetString() : null;
@@ -680,8 +810,21 @@ static class Program
         catch (Exception ex)
         {
             logger.Warn($"Failed to fetch manifest: {ex.Message}");
+            RecordUpdateCheckFailed(telemetry, ex.GetType().Name);
             return null;
         }
+    }
+
+    private static void RecordUpdateCheckFailed(TelemetryService telemetry, string errorType)
+    {
+        telemetry.Record(
+            "launcher_update_check_failed",
+            new
+            {
+                stage = "manifest_fetch",
+                error_type = errorType,
+                safe_error = "manifest_fetch_failed"
+            });
     }
 
     private static ReadOnlyMemory<byte> StripUtf8Bom(byte[] payload)
@@ -868,7 +1011,8 @@ static class Program
         string installDir,
         string runtimeDir,
         string stageDir,
-        LauncherLogger logger)
+        LauncherLogger logger,
+        TelemetryService telemetry)
     {
         var candidateExe = Path.Combine(candidate.Path, DefaultEntryExe);
         logger.Info($"Launching candidate version {candidate.Version} for health verification.");
@@ -894,7 +1038,27 @@ static class Program
 
         var rollbackExe = Path.Combine(previousGood.Path, DefaultEntryExe);
         logger.Warn($"Rolling back to last good version {previousGood.Version} at {previousGood.Path}.");
-        return LaunchApp(rollbackExe, installDir, Array.Empty<string>(), logger) == 0;
+        var rollbackExitCode = LaunchApp(rollbackExe, installDir, Array.Empty<string>(), logger, telemetry);
+        if (rollbackExitCode == 0)
+        {
+            telemetry.Record(
+                "launcher_rollback_completed",
+                new
+                {
+                    rollback_reason = "candidate_health_failed",
+                    rollback_target_available = true
+                });
+            return true;
+        }
+
+        telemetry.Record(
+            "launcher_rollback_failed",
+            new
+            {
+                rollback_reason = "candidate_health_failed",
+                safe_error = "rollback_failed"
+            });
+        return false;
     }
 
     private static CandidateHealthResult LaunchAndWaitForCandidateHealth(
@@ -1071,9 +1235,22 @@ static class Program
         }
     }
 
-    private static int LaunchApp(string appExe, string installDir, string[] args, LauncherLogger logger)
+    private static int LaunchApp(string appExe, string installDir, string[] args, LauncherLogger logger, TelemetryService telemetry)
     {
-        return StartAppProcess(appExe, installDir, args, logger, environment: null) is null ? 1 : 0;
+        var process = StartAppProcess(appExe, installDir, args, logger, environment: null);
+        if (process is not null)
+        {
+            return 0;
+        }
+
+        telemetry.Record(
+            "launcher_app_launch_failed",
+            new
+            {
+                launch_mode = "normal",
+                safe_error = "app_launch_failed"
+            });
+        return 1;
     }
 
     private static Process? StartAppProcess(

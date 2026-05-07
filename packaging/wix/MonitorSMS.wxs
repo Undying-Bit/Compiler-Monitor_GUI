@@ -61,7 +61,7 @@
             <RemoveFolder Id="RemoveProgramMenuDir" Directory="ProgramMenuDir" On="uninstall" />
           </Component>
 
-          <Component Id="EnvComponent" Guid="*" NeverOverwrite="yes">
+          <Component Id="EnvComponent" Guid="*">
             <File Id="EnvFile" Source="$(var.EnvFile)" Name=".env" KeyPath="yes" />
           </Component>
 

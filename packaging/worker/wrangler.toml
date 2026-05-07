@@ -11,6 +11,8 @@ UPDATES_PREFIX = ""
 DATA_PREFIX = ""
 # Optional. If set, requests must include Authorization: Bearer <token>.
 # UPDATE_TOKEN = "REPLACE_ME"
+# Optional. If set, telemetry ingestion requires Authorization: Bearer <token>.
+# TELEMETRY_TOKEN = "REPLACE_ME"
 
 [[r2_buckets]]
 binding = "UPDATES_BUCKET"
@@ -19,6 +21,12 @@ bucket_name = "monitor-updates"
 [[r2_buckets]]
 binding = "DATA_BUCKET"
 bucket_name = "reportes-db"
+
+[[d1_databases]]
+binding = "TELEMETRY_DB"
+database_name = "monitor-telemetry"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
 
 [env.development]
 workers_dev = true
@@ -34,3 +42,9 @@ bucket_name = "development-updates"
 [[env.development.r2_buckets]]
 binding = "DATA_BUCKET"
 bucket_name = "development-db"
+
+[[env.development.d1_databases]]
+binding = "TELEMETRY_DB"
+database_name = "development-monitor-telemetry"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"

@@ -1,12 +1,55 @@
 export interface Env {
   UPDATES_BUCKET: R2Bucket;
   DATA_BUCKET: R2Bucket;
+  TELEMETRY_DB: D1Database;
   UPDATES_PREFIX?: string;
   DATA_PREFIX?: string;
   UPDATE_TOKEN?: string;
+  TELEMETRY_TOKEN?: string;
 }
 
 type BucketRoute = "updates" | "data";
+type TelemetryEventName =
+  | "launcher_started"
+  | "first_run_after_install"
+  | "launcher_update_check_failed"
+  | "launcher_update_install_completed"
+  | "launcher_update_install_failed"
+  | "launcher_app_only_update_completed"
+  | "launcher_app_only_update_failed"
+  | "launcher_rollback_completed"
+  | "launcher_rollback_failed"
+  | "launcher_app_launch_failed";
+
+type PreparedTelemetryEvent = {
+  event: TelemetryEventName;
+  installation_id: string;
+  launcher_session_id: string;
+  timestamp: string;
+  launcher_version: string | null;
+  channel: string | null;
+  user_name: string | null;
+  user_domain: string | null;
+  os_description: string | null;
+  os_architecture: string | null;
+  payload: Record<string, unknown>;
+};
+
+const telemetryPath = "/telemetry/events";
+const maxTelemetryBodyBytes = 64 * 1024;
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const allowedTelemetryEvents = new Set<TelemetryEventName>([
+  "launcher_started",
+  "first_run_after_install",
+  "launcher_update_check_failed",
+  "launcher_update_install_completed",
+  "launcher_update_install_failed",
+  "launcher_app_only_update_completed",
+  "launcher_app_only_update_failed",
+  "launcher_rollback_completed",
+  "launcher_rollback_failed",
+  "launcher_app_launch_failed",
+]);
 
 function normalizePrefix(prefix: string): string {
   return prefix.replace(/^\/+|\/+$/g, "");
@@ -85,6 +128,11 @@ function resolveObjectTarget(pathname: string, env: Env): { route: BucketRoute; 
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === telemetryPath) {
+      return handleTelemetryRequest(request, env);
+    }
+
     if (request.method !== "GET" && request.method !== "HEAD") {
       return new Response("Method Not Allowed", { status: 405 });
     }
@@ -93,7 +141,6 @@ export default {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    const url = new URL(request.url);
     const target = resolveObjectTarget(url.pathname, env);
     if (!target) {
       return new Response("Not Found", { status: 404 });
@@ -127,3 +174,179 @@ export default {
     });
   },
 };
+
+async function handleTelemetryRequest(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405 });
+  }
+
+  if (!isAuthorized(request, env.TELEMETRY_TOKEN)) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  const body = await request.arrayBuffer();
+  if (body.byteLength > maxTelemetryBodyBytes) {
+    return new Response("Payload Too Large", { status: 413 });
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    return new Response("Bad Request", { status: 400 });
+  }
+
+  const preparedEvents = validateTelemetryRequest(parsed);
+  if (!preparedEvents) {
+    return new Response("Bad Request", { status: 400 });
+  }
+
+  const receivedAt = new Date().toISOString();
+  const statements = preparedEvents.map((event) =>
+    env.TELEMETRY_DB
+      .prepare(
+        `INSERT INTO telemetry_events (
+          received_at,
+          event,
+          installation_id,
+          launcher_session_id,
+          launcher_version,
+          channel,
+          user_name,
+          user_domain,
+          os_description,
+          os_architecture,
+          payload_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
+      )
+      .bind(
+        receivedAt,
+        event.event,
+        event.installation_id,
+        event.launcher_session_id,
+        event.launcher_version,
+        event.channel,
+        event.user_name,
+        event.user_domain,
+        event.os_description,
+        event.os_architecture,
+        JSON.stringify(event.payload),
+      ),
+  );
+
+  await env.TELEMETRY_DB.batch(statements);
+  return new Response(null, { status: 204 });
+}
+
+function validateTelemetryRequest(payload: unknown): PreparedTelemetryEvent[] | null {
+  if (!isPlainObject(payload) || !hasOnlyKeys(payload, ["events"])) {
+    return null;
+  }
+
+  const events = payload.events;
+  if (!Array.isArray(events) || events.length === 0) {
+    return null;
+  }
+
+  const prepared: PreparedTelemetryEvent[] = [];
+  for (const entry of events) {
+    const validated = validateTelemetryEvent(entry);
+    if (!validated) {
+      return null;
+    }
+
+    prepared.push(validated);
+  }
+
+  return prepared;
+}
+
+function validateTelemetryEvent(payload: unknown): PreparedTelemetryEvent | null {
+  if (!isPlainObject(payload)) {
+    return null;
+  }
+
+  const launcherSessionId = getNullableString(payload, "launcher_session_id", "session_id");
+  const launcherVersion = getNullableString(payload, "launcher_version", "app_version");
+
+  if (
+    !hasOnlyKeys(payload, [
+      "event",
+      "installation_id",
+      "launcher_session_id",
+      "session_id",
+      "timestamp",
+      "launcher_version",
+      "app_version",
+      "channel",
+      "user_name",
+      "user_domain",
+      "os_description",
+      "os_architecture",
+      "payload",
+    ])
+  ) {
+    return null;
+  }
+
+  if (
+    typeof payload.event !== "string" ||
+    !allowedTelemetryEvents.has(payload.event as TelemetryEventName) ||
+    typeof payload.installation_id !== "string" ||
+    !uuidPattern.test(payload.installation_id) ||
+    typeof launcherSessionId !== "string" ||
+    !uuidPattern.test(launcherSessionId) ||
+    typeof payload.timestamp !== "string" ||
+    Number.isNaN(Date.parse(payload.timestamp)) ||
+    !isNullableString(launcherVersion) ||
+    !isNullableString(payload.channel) ||
+    !isNullableString(payload.user_name) ||
+    !isNullableString(payload.user_domain) ||
+    !isNullableString(payload.os_description) ||
+    !isNullableString(payload.os_architecture) ||
+    !isPlainObject(payload.payload)
+  ) {
+    return null;
+  }
+
+  return {
+    event: payload.event as TelemetryEventName,
+    installation_id: payload.installation_id,
+    launcher_session_id: launcherSessionId,
+    timestamp: payload.timestamp,
+    launcher_version: launcherVersion ?? null,
+    channel: payload.channel ?? null,
+    user_name: payload.user_name ?? null,
+    user_domain: payload.user_domain ?? null,
+    os_description: payload.os_description ?? null,
+    os_architecture: payload.os_architecture ?? null,
+    payload: payload.payload,
+  };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowedKeys: string[]): boolean {
+  const allowed = new Set(allowedKeys);
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function isNullableString(value: unknown): value is string | null | undefined {
+  return value === null || value === undefined || typeof value === "string";
+}
+
+function getNullableString(
+  value: Record<string, unknown>,
+  primaryKey: string,
+  fallbackKey: string,
+): string | null | undefined {
+  const primaryValue = value[primaryKey];
+  if (primaryValue !== undefined) {
+    return isNullableString(primaryValue) ? primaryValue : null;
+  }
+
+  const fallbackValue = value[fallbackKey];
+  return isNullableString(fallbackValue) ? fallbackValue : null;
+}

@@ -8,7 +8,12 @@ param(
     [string]$ReportesKey = "",
     [string]$DebugPanelVisible = "",
     [string]$LocalDataSubdir = "",
-    [string]$UpdateArtifactPrefix = ""
+    [string]$UpdateArtifactPrefix = "",
+    [string]$TelemetryEnabled = "",
+    [string]$TelemetryEndpoint = "",
+    [string]$TelemetryApiKey = "",
+    [string]$TelemetryBatchSize = "",
+    [string]$TelemetryTimeoutSeconds = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,6 +59,22 @@ function ConvertTo-BoolText {
     exit 1
 }
 
+function ConvertTo-PositiveIntText {
+    param(
+        [object]$Value,
+        [string]$Name
+    )
+
+    $text = ([string]$Value).Trim()
+    $parsed = 0
+    if ([int]::TryParse($text, [ref]$parsed) -and $parsed -gt 0) {
+        return $parsed.ToString()
+    }
+
+    Write-Error "$Name must be a positive integer."
+    exit 1
+}
+
 if (-not $OutputPath) {
     $compileRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
     $OutputPath = Join-Path $compileRoot ".tmp\client-config\.env"
@@ -69,12 +90,35 @@ $defaultLocalDataSubdir = Get-ChannelLocalDataSubdir -Channel $resolvedChannel
 $resolvedLocalDataSubdir = Get-ResolvedValue -ExplicitValue $LocalDataSubdir -EnvName "MONITOR_LOCAL_DATA_SUBDIR" -DefaultValue $defaultLocalDataSubdir
 $defaultArtifactPrefix = Get-ChannelArtifactPrefix -Channel $resolvedChannel
 $resolvedUpdateArtifactPrefix = Get-ResolvedValue -ExplicitValue $UpdateArtifactPrefix -EnvName "MONITOR_UPDATE_ARTIFACT_PREFIX" -DefaultValue $defaultArtifactPrefix
+$resolvedTelemetryEndpoint = Get-ResolvedValue -ExplicitValue $TelemetryEndpoint -EnvName "MONITOR_TELEMETRY_ENDPOINT"
+$resolvedTelemetryApiKey = Get-ResolvedValue -ExplicitValue $TelemetryApiKey -EnvName "MONITOR_TELEMETRY_API_KEY"
 
 if ($PSBoundParameters.ContainsKey("DebugPanelVisible")) {
     $resolvedDebugPanelVisible = ConvertTo-BoolText -Value $DebugPanelVisible -Name "DebugPanelVisible"
 } else {
     $debugPanelEnv = Get-ResolvedValue -ExplicitValue "" -EnvName "MONITOR_DEBUG_PANEL_VISIBLE" -DefaultValue "false"
     $resolvedDebugPanelVisible = ConvertTo-BoolText -Value $debugPanelEnv -Name "MONITOR_DEBUG_PANEL_VISIBLE"
+}
+
+if ($PSBoundParameters.ContainsKey("TelemetryEnabled")) {
+    $resolvedTelemetryEnabled = ConvertTo-BoolText -Value $TelemetryEnabled -Name "TelemetryEnabled"
+} else {
+    $telemetryEnabledEnv = Get-ResolvedValue -ExplicitValue "" -EnvName "MONITOR_TELEMETRY_ENABLED" -DefaultValue "false"
+    $resolvedTelemetryEnabled = ConvertTo-BoolText -Value $telemetryEnabledEnv -Name "MONITOR_TELEMETRY_ENABLED"
+}
+
+if ($PSBoundParameters.ContainsKey("TelemetryBatchSize")) {
+    $resolvedTelemetryBatchSize = ConvertTo-PositiveIntText -Value $TelemetryBatchSize -Name "TelemetryBatchSize"
+} else {
+    $telemetryBatchSizeEnv = Get-ResolvedValue -ExplicitValue "" -EnvName "MONITOR_TELEMETRY_BATCH_SIZE" -DefaultValue "10"
+    $resolvedTelemetryBatchSize = ConvertTo-PositiveIntText -Value $telemetryBatchSizeEnv -Name "MONITOR_TELEMETRY_BATCH_SIZE"
+}
+
+if ($PSBoundParameters.ContainsKey("TelemetryTimeoutSeconds")) {
+    $resolvedTelemetryTimeoutSeconds = ConvertTo-PositiveIntText -Value $TelemetryTimeoutSeconds -Name "TelemetryTimeoutSeconds"
+} else {
+    $telemetryTimeoutEnv = Get-ResolvedValue -ExplicitValue "" -EnvName "MONITOR_TELEMETRY_TIMEOUT_SECONDS" -DefaultValue "4"
+    $resolvedTelemetryTimeoutSeconds = ConvertTo-PositiveIntText -Value $telemetryTimeoutEnv -Name "MONITOR_TELEMETRY_TIMEOUT_SECONDS"
 }
 
 if ([string]::IsNullOrWhiteSpace($resolvedManifestUrl)) {
@@ -102,6 +146,11 @@ $lines = @(
     "MONITOR_KEY_REPORTES=$resolvedReportesKey"
     "MONITOR_UPDATE_MANIFEST_URL=$resolvedManifestUrl"
     "MONITOR_DEBUG_PANEL_VISIBLE=$resolvedDebugPanelVisible"
+    "MONITOR_TELEMETRY_ENABLED=$resolvedTelemetryEnabled"
+    "MONITOR_TELEMETRY_ENDPOINT=$resolvedTelemetryEndpoint"
+    "MONITOR_TELEMETRY_API_KEY=$resolvedTelemetryApiKey"
+    "MONITOR_TELEMETRY_BATCH_SIZE=$resolvedTelemetryBatchSize"
+    "MONITOR_TELEMETRY_TIMEOUT_SECONDS=$resolvedTelemetryTimeoutSeconds"
 )
 
 $lines | Set-Content -Path $OutputPath -Encoding UTF8
